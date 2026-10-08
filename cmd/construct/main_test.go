@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -139,6 +140,79 @@ func TestBuildLayers(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("app layer:\n got %q\nwant %q", got, want)
+	}
+}
+
+func gitInit(t *testing.T, dir, remote string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main"},
+		{"remote", "add", "origin", remote},
+		{"-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "one"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+}
+
+func TestBuildConfigAndAnnotations(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	repo := t.TempDir()
+	gitInit(t, repo, "git@example.com:org/app.git")
+	t.Chdir(repo)
+
+	manifest := func(extra ...string) (*v1.Manifest, *v1.ConfigFile) {
+		t.Helper()
+		dir := filepath.Join(t.TempDir(), "layout")
+		args := append([]string{"build", "-oci-layout", dir, "-platform", "linux/amd64"}, extra...)
+		if code, _, stderr := runCLI(t, args...); code != 0 {
+			t.Fatalf("build exit %d: %s", code, stderr)
+		}
+		a, err := image.ReadLayout(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := a.(v1.Image).Manifest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cf, err := a.(v1.Image).ConfigFile()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m, cf
+	}
+
+	m, cf := manifest("-expose", "8080", "-expose", "53/udp", "-volume", "/data", "-stop-signal", "SIGINT",
+		"-annotation", "org.opencontainers.image.source=https://override.example.com/app")
+	if len(m.Annotations["org.opencontainers.image.revision"]) != 40 {
+		t.Errorf("revision annotation = %q", m.Annotations["org.opencontainers.image.revision"])
+	}
+	if got := m.Annotations["org.opencontainers.image.source"]; got != "https://override.example.com/app" {
+		t.Errorf("source annotation = %q, want the -annotation override", got)
+	}
+	c := cf.Config
+	if _, ok := c.ExposedPorts["53/udp"]; !ok || len(c.ExposedPorts) != 2 || len(c.Volumes) != 1 || c.StopSignal != "SIGINT" {
+		t.Errorf("config = %+v", c)
+	}
+
+	m, _ = manifest()
+	if got := m.Annotations["org.opencontainers.image.source"]; got != "https://example.com/org/app" {
+		t.Errorf("source annotation = %q", got)
+	}
+	m, _ = manifest("-vcs=false")
+	if len(m.Annotations) != 0 {
+		t.Errorf("-vcs=false annotations = %v", m.Annotations)
+	}
+
+	if code, _, _ := runCLI(t, "build", "-oci-layout", t.TempDir(), "-expose", "http"); code != 2 {
+		t.Errorf("bad -expose exit %d, want 2", code)
 	}
 }
 

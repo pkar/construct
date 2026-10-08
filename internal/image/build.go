@@ -3,6 +3,8 @@ package image
 import (
 	"context"
 	"fmt"
+	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,6 +42,15 @@ type Spec struct {
 	// Empty WorkDir and User inherit the base value.
 	WorkDir string
 	User    string
+	// ExposedPorts are PORT[/PROTO] (tcp when omitted) and Volumes are
+	// absolute paths; both add to the base image's values.
+	ExposedPorts []string
+	Volumes      []string
+	// StopSignal, such as SIGTERM, replaces the base value when set.
+	StopSignal string
+	// Annotations are set on the image manifest, and on the index for
+	// multi-platform builds.
+	Annotations map[string]string
 
 	// Created stamps the image config, history, and file times.
 	Created time.Time
@@ -120,7 +131,14 @@ func Build(ctx context.Context, spec Spec, opts Options) (v1.Image, error) {
 	if err := applyConfig(cf, spec); err != nil {
 		return nil, err
 	}
-	return mutate.ConfigFile(img, cf)
+	img, err = mutate.ConfigFile(img, cf)
+	if err != nil {
+		return nil, err
+	}
+	if len(spec.Annotations) > 0 {
+		img = mutate.Annotations(img, spec.Annotations).(v1.Image)
+	}
+	return img, nil
 }
 
 func baseImage(ctx context.Context, spec Spec, opts Options) (v1.Image, error) {
@@ -216,7 +234,11 @@ func BuildIndex(ctx context.Context, spec Spec, platforms []v1.Platform, opts Op
 	if allDocker {
 		indexType = types.DockerManifestList
 	}
-	return mutate.AppendManifests(mutate.IndexMediaType(empty.Index, indexType), adds...), nil
+	idx := mutate.AppendManifests(mutate.IndexMediaType(empty.Index, indexType), adds...)
+	if len(spec.Annotations) > 0 {
+		idx = mutate.Annotations(idx, spec.Annotations).(v1.ImageIndex)
+	}
+	return idx, nil
 }
 
 // ParsePlatforms parses a comma-separated list of os/arch[/variant].
@@ -288,7 +310,48 @@ func applyConfig(cf *v1.ConfigFile, spec Spec) error {
 			c.Labels[k] = v
 		}
 	}
+	for _, p := range spec.ExposedPorts {
+		port, err := ParsePort(p)
+		if err != nil {
+			return err
+		}
+		if c.ExposedPorts == nil {
+			c.ExposedPorts = map[string]struct{}{}
+		}
+		c.ExposedPorts[port] = struct{}{}
+	}
+	for _, v := range spec.Volumes {
+		if !path.IsAbs(v) {
+			return fmt.Errorf("volume %q: want an absolute path", v)
+		}
+		if c.Volumes == nil {
+			c.Volumes = map[string]struct{}{}
+		}
+		c.Volumes[path.Clean(v)] = struct{}{}
+	}
+	if spec.StopSignal != "" {
+		c.StopSignal = spec.StopSignal
+	}
 	return nil
+}
+
+// ParsePort normalises PORT[/PROTO] to the PORT/PROTO form used in image
+// configs. PROTO is tcp, udp, or sctp and defaults to tcp.
+func ParsePort(s string) (string, error) {
+	port, proto, hasProto := strings.Cut(s, "/")
+	if !hasProto {
+		proto = "tcp"
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return "", fmt.Errorf("port %q: want PORT[/tcp|udp|sctp] with PORT 1-65535", s)
+	}
+	switch proto {
+	case "tcp", "udp", "sctp":
+	default:
+		return "", fmt.Errorf("port %q: want PORT[/tcp|udp|sctp] with PORT 1-65535", s)
+	}
+	return strconv.Itoa(n) + "/" + proto, nil
 }
 
 func setEnv(env []string, key, kv string) []string {
