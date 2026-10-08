@@ -363,6 +363,117 @@ images:
 	}
 }
 
+func TestLockAndLockedBuild(t *testing.T) {
+	t.Setenv("DOCKER_CONFIG", t.TempDir())
+	srv := httptest.NewServer(registry.New())
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	ctx := context.Background()
+	baseRef := u.Host + "/base:stable"
+
+	// pushBase pushes a new image to base:stable and returns its digest.
+	pushBase := func(env string) string {
+		t.Helper()
+		img, err := image.Build(ctx, image.Spec{Base: image.Scratch, Platform: v1.Platform{OS: "linux", Architecture: "amd64"}, Env: []string{env}}, image.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, err := image.Push(ctx, img, baseRef, image.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d.DigestStr()
+	}
+	first := pushBase("V=1")
+
+	dir := t.TempDir()
+	file := filepath.Join(dir, "construct.yaml")
+	doc := "base: " + baseRef + "\nplatforms: linux/amd64\nvcs: false\noci-layout: out\n"
+	if err := os.WriteFile(file, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// -locked with no lock file is refused.
+	if code, _, stderr := runCLI(t, "build", "-f", file, "-locked"); code != 2 {
+		t.Fatalf("-locked without lock: exit %d: %s", code, stderr)
+	}
+	code, out, stderr := runCLI(t, "lock", "-f", file)
+	if code != 0 || !strings.Contains(out, baseRef+" "+first) {
+		t.Fatalf("lock exit %d out %q: %s", code, out, stderr)
+	}
+
+	baseDigest := func() string {
+		t.Helper()
+		a, err := image.ReadLayout(filepath.Join(dir, "out"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := a.(v1.Image).Manifest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.Annotations["org.opencontainers.image.base.name"] != baseRef {
+			t.Errorf("base.name = %q", m.Annotations["org.opencontainers.image.base.name"])
+		}
+		return m.Annotations["org.opencontainers.image.base.digest"]
+	}
+
+	// The tag moves, but the locked build keeps the old base.
+	second := pushBase("V=2")
+	if code, _, stderr := runCLI(t, "build", "-f", file, "-locked"); code != 0 {
+		t.Fatalf("locked build exit %d: %s", code, stderr)
+	}
+	if got := baseDigest(); got != first {
+		t.Errorf("locked build used base %s, want %s", got, first)
+	}
+	// Relocking picks up the new base.
+	if code, _, stderr := runCLI(t, "lock", "-f", file); code != 0 {
+		t.Fatalf("relock exit %d: %s", code, stderr)
+	}
+	if code, _, stderr := runCLI(t, "build", "-f", file); code != 0 {
+		t.Fatalf("build exit %d: %s", code, stderr)
+	}
+	if got := baseDigest(); got != second {
+		t.Errorf("relocked build used base %s, want %s", got, second)
+	}
+
+	// A base missing from the lock fails -locked and is added otherwise.
+	other := u.Host + "/base:other"
+	if _, err := image.Push(ctx, mustBuildScratch(t), other, image.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, stderr := runCLI(t, "build", "-f", file, "-base", other, "-locked"); code != 1 || !strings.Contains(stderr, "construct lock") {
+		t.Errorf("-locked with unlocked base: exit %d: %s", code, stderr)
+	}
+	if code, _, stderr := runCLI(t, "build", "-f", file, "-base", other); code != 0 || !strings.Contains(stderr, "updated ") {
+		t.Errorf("build adding base: exit %d: %s", code, stderr)
+	}
+	l, err := image.ReadLock(filepath.Join(dir, "construct.lock"))
+	if err != nil || len(l.Bases) != 2 {
+		t.Errorf("lock = %+v, %v; want two bases", l, err)
+	}
+
+	// Without a build file, lock needs explicit bases and a path.
+	lockFile := filepath.Join(t.TempDir(), "x.lock")
+	if code, _, stderr := runCLI(t, "lock", "-lock", lockFile, "-base", baseRef); code != 0 {
+		t.Errorf("lock -base exit %d: %s", code, stderr)
+	}
+	for _, args := range [][]string{{"lock"}, {"lock", "-base", baseRef}, {"lock", "-base", baseRef, "-lock", lockFile, "api"}} {
+		if code, _, _ := runCLI(t, args...); code != 2 {
+			t.Errorf("%q: exit %d, want 2", args, code)
+		}
+	}
+}
+
+func mustBuildScratch(t *testing.T) v1.Image {
+	t.Helper()
+	img, err := image.Build(context.Background(), image.Spec{Base: image.Scratch, Platform: v1.Platform{OS: "linux", Architecture: "amd64"}}, image.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return img
+}
+
 func TestBuildLayoutThenPush(t *testing.T) {
 	t.Setenv("DOCKER_CONFIG", t.TempDir())
 	t.Setenv("SOURCE_DATE_EPOCH", "1700000000")

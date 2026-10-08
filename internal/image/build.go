@@ -1,6 +1,7 @@
 package image
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"path"
@@ -24,6 +25,10 @@ const Scratch = "scratch"
 type Spec struct {
 	// Base is a registry reference, or Scratch for an empty image.
 	Base string
+	// BaseName is the human-readable base reference recorded in the
+	// org.opencontainers.image.base.name annotation, when Base has been
+	// pinned to a digest. It defaults to Base.
+	BaseName string
 	// Platform selects the base image from a multi-platform index and is
 	// recorded in the config of scratch images.
 	Platform v1.Platform
@@ -85,10 +90,11 @@ func (o Options) remoteOptions(ctx context.Context) []remote.Option {
 
 // Build assembles the image described by spec.
 func Build(ctx context.Context, spec Spec, opts Options) (v1.Image, error) {
-	img, err := baseImage(ctx, spec, opts)
+	base, err := baseImage(ctx, spec, opts)
 	if err != nil {
 		return nil, err
 	}
+	img := base
 
 	mt, err := img.MediaType()
 	if err != nil {
@@ -149,10 +155,33 @@ func Build(ctx context.Context, spec Spec, opts Options) (v1.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(spec.Annotations) > 0 {
-		img = mutate.Annotations(img, spec.Annotations).(v1.Image)
+	anns, err := baseAnnotations(spec, base)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range spec.Annotations {
+		anns[k] = v
+	}
+	if len(anns) > 0 {
+		img = mutate.Annotations(img, anns).(v1.Image)
 	}
 	return img, nil
+}
+
+// baseAnnotations records which base image was used, as the OCI image
+// spec suggests, so scanners can tell when a rebuild is due.
+func baseAnnotations(spec Spec, base v1.Image) (map[string]string, error) {
+	anns := map[string]string{}
+	if spec.Base == "" || spec.Base == Scratch {
+		return anns, nil
+	}
+	d, err := base.Digest()
+	if err != nil {
+		return nil, err
+	}
+	anns["org.opencontainers.image.base.name"] = cmp.Or(spec.BaseName, spec.Base)
+	anns["org.opencontainers.image.base.digest"] = d.String()
+	return anns, nil
 }
 
 func baseImage(ctx context.Context, spec Spec, opts Options) (v1.Image, error) {
