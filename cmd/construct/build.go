@@ -52,6 +52,8 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		compress   = fs.String("compression", "", "layer `compression`: gzip (default), or zstd (smaller and faster; needs an OCI base\nand a recent runtime)")
 		level      = fs.Int("compression-level", 0, "compression `level`: 1-9 for gzip, 1-22 for zstd; 0 for the default")
 		useVCS     = fs.Bool("vcs", true, "annotate the image with the Git commit and source URL")
+		lockPath   = fs.String("lock", "", "pin base images to the digests in lock `file`, adding missing ones (default\nconstruct.lock next to -f, when it exists)")
+		locked     = fs.Bool("locked", false, "fail if a base image is missing from the lock file; never update it")
 		entrypoint optionalList
 		cmd        optionalList
 		layers     layerFlags
@@ -137,8 +139,9 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 
 	var (
-		images []config.Image
-		dir    = "."
+		images  []config.Image
+		dir     = "."
+		fileDir string
 	)
 	if *file == "" {
 		if fs.NArg() > 0 {
@@ -157,7 +160,15 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		for _, im := range sel {
 			images = append(images, config.Merge(im, over))
 		}
-		dir = f.Dir
+		dir, fileDir = f.Dir, f.Dir
+	}
+	lock, err := openLock(*lockPath, fileDir, *locked)
+	if err != nil {
+		var ue usageError
+		if errors.As(err, &ue) {
+			return usageErr(fs, "%v", err)
+		}
+		return err
 	}
 
 	plans := make([]*plan, 0, len(images))
@@ -181,7 +192,13 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			}
 			outputs[abs] = p.label()
 		}
+		if err := lock.pin(ctx, p); err != nil {
+			return p.errorf("%w", err)
+		}
 		plans = append(plans, p)
+	}
+	if err := lock.save(stderr); err != nil {
+		return err
 	}
 	for _, p := range plans {
 		if err := p.run(ctx, stdout, stderr); err != nil {

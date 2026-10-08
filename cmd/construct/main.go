@@ -20,11 +20,12 @@ var version = "dev"
 const usage = `construct builds OCI container images and pushes them to registries.
 
 Usage:
-  construct build [flags]          build an image from a base and local files
-  construct push [flags] DIR REF   push the image or index in an OCI layout to REF
-  construct version                print the version
+  construct build [flags]           build an image from a base and local files
+  construct push [flags] DIR REF    push the image or index in an OCI layout to REF
+  construct lock [flags] [IMAGE...] pin base images to digests in construct.lock
+  construct version                 print the version
 
-Run 'construct build -h' or 'construct push -h' for flags.
+Run 'construct COMMAND -h' for flags.
 
 Registry credentials come from the Docker config (~/.docker/config.json,
 including credential helpers), so 'docker login' or 'crane auth login' work.
@@ -51,6 +52,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		err = runBuild(ctx, args[1:], stdout, stderr)
 	case "push":
 		err = runPush(ctx, args[1:], stdout, stderr)
+	case "lock":
+		err = runLock(ctx, args[1:], stdout, stderr)
 	case "version", "-v", "--version":
 		fmt.Fprintln(stdout, "construct", version)
 	case "help", "-h", "--help":
