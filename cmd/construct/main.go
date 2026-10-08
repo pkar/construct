@@ -22,6 +22,7 @@ const usage = `construct builds OCI container images and pushes them to registri
 Usage:
   construct build [flags]           build an image from a base and local files
   construct push [flags] DIR REF    push the image or index in an OCI layout to REF
+  construct load [flags] DIR        load the image in an OCI layout into docker or podman
   construct lock [flags] [IMAGE...] pin base images to digests in construct.lock
   construct version                 print the version
 
@@ -52,6 +53,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		err = runBuild(ctx, args[1:], stdout, stderr)
 	case "push":
 		err = runPush(ctx, args[1:], stdout, stderr)
+	case "load":
+		err = runLoad(ctx, args[1:], stdout, stderr)
 	case "lock":
 		err = runLock(ctx, args[1:], stdout, stderr)
 	case "version", "-v", "--version":

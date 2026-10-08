@@ -45,6 +45,8 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		push       = fs.Bool("push", false, "push the image to every -tag")
 		layoutDir  = fs.String("oci-layout", "", "write the image to an OCI layout `directory`")
 		tarFile    = fs.String("tarball", "", "write a docker/podman-loadable tarball to `file` (needs -tag)")
+		load       = fs.Bool("load", false, "load the image into the local container engine (needs -tag); for several platforms,\nthe linux/"+runtime.GOARCH+" image is loaded")
+		engine     = fs.String("engine", "", "container `engine` for -load: docker or podman (default: whichever is installed)")
 		workdir    = fs.String("workdir", "", "working `directory`")
 		user       = fs.String("user", "", "`user[:group]` to run as")
 		insecure   = fs.Bool("insecure", false, "allow plain HTTP and unverified TLS registries")
@@ -98,6 +100,10 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			over.OCILayout = layoutDir
 		case "tarball":
 			over.Tarball = tarFile
+		case "load":
+			over.Load = load
+		case "engine":
+			over.Engine = engine
 		case "workdir":
 			over.WorkDir = workdir
 		case "user":
@@ -222,6 +228,8 @@ type plan struct {
 	push      bool
 	layout    string
 	tarball   string
+	load      bool
+	engine    string
 	opts      image.Options
 }
 
@@ -248,13 +256,25 @@ func newPlan(im config.Image, dir string, stderr io.Writer) (*plan, error) {
 		push:    deref(im.Push),
 		layout:  deref(im.OCILayout),
 		tarball: deref(im.Tarball),
+		load:    deref(im.Load),
+		engine:  deref(im.Engine),
 		opts:    image.Options{Insecure: deref(im.Insecure)},
 	}
-	if !p.push && p.layout == "" && p.tarball == "" {
-		return p, usagef("nothing to do: set -push, -oci-layout, or -tarball")
+	if !p.push && p.layout == "" && p.tarball == "" && !p.load {
+		return p, usagef("nothing to do: set -push, -oci-layout, -tarball, or -load")
 	}
-	if (p.push || p.tarball != "") && len(im.Tags) == 0 {
-		return p, usagef("-push and -tarball need -tag")
+	if (p.push || p.tarball != "" || p.load) && len(im.Tags) == 0 {
+		return p, usagef("-push, -tarball, and -load need -tag")
+	}
+	if p.engine != "" && !p.load {
+		return p, usagef("-engine only applies with -load")
+	}
+	if p.load {
+		path, err := image.FindEngine(p.engine)
+		if err != nil {
+			return p, err
+		}
+		p.engine = path
 	}
 	compression, level := deref(im.Compression), deref(im.CompressionLevel)
 	if err := image.CheckCompression(compression, level); err != nil {
@@ -381,6 +401,16 @@ func (p *plan) run(ctx context.Context, stdout, stderr io.Writer) error {
 		}
 		fmt.Fprintf(stderr, "%swrote tarball %s\n", prefix, p.tarball)
 	}
+	if p.load {
+		img, err := image.SelectPlatform(art, hostPlatform())
+		if err != nil {
+			return fmt.Errorf("load: %w", err)
+		}
+		if err := image.Load(ctx, p.engine, img, p.tags, p.opts, stderr); err != nil {
+			return err
+		}
+		fmt.Fprintf(stderr, "%sloaded %s into %s\n", prefix, strings.Join(p.tags, ", "), filepath.Base(p.engine))
+	}
 	if p.push {
 		refs, err := image.PushAll(ctx, art, p.tags, p.opts)
 		if err != nil {
@@ -396,6 +426,12 @@ func (p *plan) run(ctx context.Context, stdout, stderr io.Writer) error {
 	}
 	fmt.Fprintln(stdout, digest)
 	return nil
+}
+
+// hostPlatform is the platform a local engine runs: Linux on this CPU,
+// since Docker and Podman run Linux containers in a VM on macOS.
+func hostPlatform() v1.Platform {
+	return v1.Platform{OS: "linux", Architecture: runtime.GOARCH}
 }
 
 func deref[T any](p *T) T {
