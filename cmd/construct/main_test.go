@@ -41,6 +41,7 @@ func TestUsageErrors(t *testing.T) {
 		{"push args", []string{"push", "only-one"}, 2},
 		{"bad add", []string{"build", "-oci-layout", t.TempDir(), "-add", "app:relative"}, 1},
 		{"bad platform", []string{"build", "-oci-layout", t.TempDir(), "-platform", "a/b/c/d"}, 1},
+		{"multi-platform tarball", []string{"build", "-tag", "app:v1", "-tarball", "x.tar", "-platform", "linux/amd64,linux/arm64"}, 2},
 		{"help", []string{"build", "-h"}, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -142,5 +143,49 @@ func TestBuildLayoutThenPush(t *testing.T) {
 	}
 	if !strings.HasSuffix(strings.TrimSpace(out), "@"+digest) {
 		t.Errorf("build -push printed %q, want digest %s", out, digest)
+	}
+}
+
+func TestBuildMultiPlatform(t *testing.T) {
+	t.Setenv("DOCKER_CONFIG", t.TempDir())
+	srv := httptest.NewServer(registry.New())
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+
+	src := t.TempDir()
+	for _, arch := range []string{"amd64", "arm64"} {
+		if err := os.WriteFile(filepath.Join(src, "app-linux-"+arch), []byte(arch), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tag := u.Host + "/demo/multi:v1"
+	code, out, stderr := runCLI(t, "build",
+		"-platform", "linux/amd64,linux/arm64",
+		"-add", filepath.Join(src, "app-{os}-{arch}")+":/app",
+		"-entrypoint", "/app",
+		"-tag", tag,
+		"-push",
+	)
+	if code != 0 {
+		t.Fatalf("build exit %d: %s", code, stderr)
+	}
+	ref, err := name.ParseReference(strings.TrimSpace(out))
+	if err != nil {
+		t.Fatalf("build printed %q: %v", out, err)
+	}
+	idx, err := remote.Index(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	im, err := idx.IndexManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, d := range im.Manifests {
+		got = append(got, d.Platform.String())
+	}
+	if want := []string{"linux/amd64", "linux/arm64"}; !slices.Equal(got, want) {
+		t.Errorf("platforms = %q, want %q", got, want)
 	}
 }

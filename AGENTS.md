@@ -7,8 +7,15 @@ container daemon, and writes them to a registry, an OCI layout, or a
 
 - `cmd/construct/`: CLI entry point, flag parsing, `version` stamped via
   `-X main.version`.
-- `internal/image/`: layer packing (`layer.go`), image assembly (`build.go`),
-  and outputs (`output.go`).
+- `internal/image/`: layer packing (`layer.go`, streamed from disk through a
+  pipe), image and multi-platform index assembly (`build.go`), and outputs
+  (`output.go`: registry, OCI layout, docker tarball).
+- `.github/workflows/`: `ci.yml` (Linux/macOS checks) and `release.yml`
+  (tests, then `make dist` and `gh release create` on `v*` tags). Release
+  targets live in `DIST_TARGETS` in the Makefile.
+
+GitHub remote: `git@github.com:pkar/construct.git`. Do not push tags or
+publish releases unless asked.
 
 Builds must stay reproducible: sorted tar entries, root ownership, and
 timestamps from `SOURCE_DATE_EPOCH` (default Unix epoch). Tests use an

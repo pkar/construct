@@ -26,7 +26,8 @@ type Spec struct {
 	// recorded in the config of scratch images.
 	Platform v1.Platform
 	// Adds become one new layer on top of the base. No layer is added when
-	// Adds is empty.
+	// Adds is empty. {os}, {arch}, and {variant} in Src are replaced with
+	// the platform's values, so one spec can pick per-platform binaries.
 	Adds []Add
 
 	// Nil Entrypoint or Cmd inherit the base value; an empty non-nil slice
@@ -74,6 +75,7 @@ func Build(ctx context.Context, spec Spec, opts Options) (v1.Image, error) {
 	}
 
 	if len(spec.Adds) > 0 {
+		adds := expandAdds(spec.Adds, spec.Platform)
 		mt, err := img.MediaType()
 		if err != nil {
 			return nil, err
@@ -82,7 +84,7 @@ func Build(ctx context.Context, spec Spec, opts Options) (v1.Image, error) {
 		if mt == types.DockerManifestSchema2 {
 			layerType = types.DockerLayer
 		}
-		layer, err := Layer(spec.Adds, spec.Created, layerType)
+		layer, err := Layer(adds, spec.Created, layerType)
 		if err != nil {
 			return nil, fmt.Errorf("build layer: %w", err)
 		}
@@ -91,7 +93,7 @@ func Build(ctx context.Context, spec Spec, opts Options) (v1.Image, error) {
 			MediaType: layerType,
 			History: v1.History{
 				Created:   v1.Time{Time: spec.Created},
-				CreatedBy: "construct: add " + describeAdds(spec.Adds),
+				CreatedBy: "construct: add " + describeAdds(adds),
 			},
 		})
 		if err != nil {
@@ -135,7 +137,107 @@ func baseImage(ctx context.Context, spec Spec, opts Options) (v1.Image, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pull base %s: %w", ref, err)
 	}
+	// A single-platform base is returned whatever platform was asked for,
+	// so check it rather than silently mixing architectures.
+	cf, err := img.ConfigFile()
+	if err != nil {
+		return nil, fmt.Errorf("pull base %s: %w", ref, err)
+	}
+	if !platformMatches(cf, spec.Platform) {
+		return nil, fmt.Errorf("base %s is %s, not %s", ref, cf.Platform(), spec.Platform)
+	}
 	return img, nil
+}
+
+func platformMatches(cf *v1.ConfigFile, want v1.Platform) bool {
+	if want.OS == "" || (cf.OS == "" && cf.Architecture == "") {
+		return true
+	}
+	if cf.OS != want.OS || cf.Architecture != want.Architecture {
+		return false
+	}
+	return cf.Variant == "" || want.Variant == "" || cf.Variant == want.Variant
+}
+
+// BuildIndex builds spec once per platform and returns a multi-platform
+// image index. The index is an OCI index unless every image uses Docker
+// manifests, in which case it is a Docker manifest list.
+func BuildIndex(ctx context.Context, spec Spec, platforms []v1.Platform, opts Options) (v1.ImageIndex, error) {
+	if len(platforms) == 0 {
+		return nil, fmt.Errorf("no platforms")
+	}
+	seen := map[string]bool{}
+	adds := make([]mutate.IndexAddendum, 0, len(platforms))
+	allDocker := true
+	for _, p := range platforms {
+		if seen[p.String()] {
+			return nil, fmt.Errorf("platform %s listed twice", p)
+		}
+		seen[p.String()] = true
+
+		s := spec
+		s.Platform = p
+		img, err := Build(ctx, s, opts)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", p, err)
+		}
+		mt, err := img.MediaType()
+		if err != nil {
+			return nil, err
+		}
+		if mt != types.DockerManifestSchema2 {
+			allDocker = false
+		}
+		cf, err := img.ConfigFile()
+		if err != nil {
+			return nil, err
+		}
+		plat := cf.Platform()
+		if plat == nil {
+			plat = &p
+		}
+		adds = append(adds, mutate.IndexAddendum{
+			Add:        img,
+			Descriptor: v1.Descriptor{Platform: plat},
+		})
+	}
+	indexType := types.OCIImageIndex
+	if allDocker {
+		indexType = types.DockerManifestList
+	}
+	return mutate.AppendManifests(mutate.IndexMediaType(empty.Index, indexType), adds...), nil
+}
+
+// ParsePlatforms parses a comma-separated list of os/arch[/variant].
+func ParsePlatforms(s string) ([]v1.Platform, error) {
+	var out []v1.Platform
+	for _, f := range strings.Split(s, ",") {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		p, err := v1.ParsePlatform(f)
+		if err != nil {
+			return nil, fmt.Errorf("platform %q: %w", f, err)
+		}
+		if p.OS == "" || p.Architecture == "" {
+			return nil, fmt.Errorf("platform %q: want os/arch[/variant]", f)
+		}
+		out = append(out, *p)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no platform given")
+	}
+	return out, nil
+}
+
+func expandAdds(adds []Add, p v1.Platform) []Add {
+	r := strings.NewReplacer("{os}", p.OS, "{arch}", p.Architecture, "{variant}", p.Variant)
+	out := make([]Add, len(adds))
+	for i, a := range adds {
+		out[i] = Add{Src: r.Replace(a.Src), Dst: a.Dst}
+	}
+	return out
 }
 
 func applyConfig(cf *v1.ConfigFile, spec Spec) error {

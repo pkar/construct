@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
 
@@ -25,13 +26,37 @@ func TestParseAdd(t *testing.T) {
 	}
 }
 
+// layerTar returns the uncompressed tar stream for adds.
+func layerTar(adds []Add, mtime time.Time) ([]byte, error) {
+	entries, err := collectEntries(adds)
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	if err := writeTar(&buf, entries, mtime); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 type tarEntry struct {
 	name, link, body string
 	typ              byte
 	mode             int64
 }
 
+// readTar returns the entries of r, checking root ownership and mtime 42.
 func readTar(t *testing.T, r io.Reader) []tarEntry {
+	t.Helper()
+	return readTarEntries(t, r, true)
+}
+
+func readTarNoChecks(t *testing.T, r io.Reader) []tarEntry {
+	t.Helper()
+	return readTarEntries(t, r, false)
+}
+
+func readTarEntries(t *testing.T, r io.Reader, check bool) []tarEntry {
 	t.Helper()
 	var out []tarEntry
 	tr := tar.NewReader(r)
@@ -43,10 +68,10 @@ func readTar(t *testing.T, r io.Reader) []tarEntry {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if hdr.Uid != 0 || hdr.Gid != 0 || hdr.Uname != "" || hdr.Gname != "" {
+		if check && (hdr.Uid != 0 || hdr.Gid != 0 || hdr.Uname != "" || hdr.Gname != "") {
 			t.Errorf("%s: owner %d:%d %q:%q, want root", hdr.Name, hdr.Uid, hdr.Gid, hdr.Uname, hdr.Gname)
 		}
-		if !hdr.ModTime.Equal(time.Unix(42, 0)) {
+		if check && !hdr.ModTime.Equal(time.Unix(42, 0)) {
 			t.Errorf("%s: mtime %v, want 42", hdr.Name, hdr.ModTime)
 		}
 		body, err := io.ReadAll(tr)
@@ -154,6 +179,45 @@ func TestLayerDeterministic(t *testing.T) {
 	}
 	if second := digest(); first != second {
 		t.Errorf("digest changed between builds: %s != %s", first, second)
+	}
+}
+
+// Layers are streamed from disk on every read rather than buffered, so a
+// source that shrinks after Layer is called must fail the read loudly.
+func TestLayerStreamsFromDisk(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "big")
+	writeFile(t, src, string(bytes.Repeat([]byte("x"), 1<<20)), 0o644)
+	l, err := Layer([]Add{{Src: src, Dst: "/big"}}, time.Unix(42, 0), types.OCILayer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, err := l.Uncompressed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := readTar(t, rc)
+	rc.Close()
+	if len(entries) != 1 || len(entries[0].body) != 1<<20 {
+		t.Fatalf("entries = %d, want one 1 MiB file", len(entries))
+	}
+
+	if err := os.WriteFile(src, []byte("short"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rc, err = l.Uncompressed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	if _, err := io.Copy(io.Discard, rc); err == nil {
+		t.Fatal("want error reading a layer whose source shrank")
+	}
+}
+
+func TestExpandAdds(t *testing.T) {
+	got := expandAdds([]Add{{Src: "dist/app-{os}-{arch}{variant}", Dst: "/{arch}"}}, v1.Platform{OS: "linux", Architecture: "arm", Variant: "v7"})
+	if want := (Add{Src: "dist/app-linux-armv7", Dst: "/{arch}"}); got[0] != want {
+		t.Errorf("expandAdds = %+v, want %+v", got[0], want)
 	}
 }
 
