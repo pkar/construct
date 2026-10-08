@@ -1,10 +1,15 @@
 package image
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -189,13 +194,98 @@ func writeTarball(w io.Writer, a Artifact, tags []string, opts Options) error {
 	if len(tags) == 0 {
 		return fmt.Errorf("a tarball needs a tag")
 	}
-	refs := map[name.Reference]v1.Image{}
+	repoTags := make([]string, 0, len(tags))
 	for _, tag := range tags {
 		t, err := name.NewTag(tag, opts.nameOptions()...)
 		if err != nil {
 			return fmt.Errorf("tag %q: %w", tag, err)
 		}
-		refs[t] = img
+		// docker load wants the short form, with an explicit :latest.
+		s := t.String()
+		if t.TagStr() == name.DefaultTag && !strings.HasSuffix(s, ":"+name.DefaultTag) {
+			s += ":" + name.DefaultTag
+		}
+		repoTags = append(repoTags, s)
 	}
-	return tarball.MultiRefWrite(refs, w)
+
+	// This is the `docker save` format, written here rather than with
+	// tarball.MultiRefWrite because that orders tags by map iteration, so
+	// the same image could give different bytes.
+	cfgName, err := img.ConfigName()
+	if err != nil {
+		return err
+	}
+	cfg, err := img.RawConfigFile()
+	if err != nil {
+		return err
+	}
+	layers, err := img.Layers()
+	if err != nil {
+		return err
+	}
+	tw := tar.NewWriter(w)
+	if err := writeTarEntry(tw, cfgName.String(), bytes.NewReader(cfg), int64(len(cfg))); err != nil {
+		return err
+	}
+	files := make([]string, 0, len(layers))
+	written := map[string]bool{}
+	for _, l := range layers {
+		d, err := l.Digest()
+		if err != nil {
+			return err
+		}
+		mt, err := l.MediaType()
+		if err != nil {
+			return err
+		}
+		if !mt.IsDistributable() {
+			return fmt.Errorf("layer %s has non-distributable media type %s", d, mt)
+		}
+		file := d.Hex + ".tar.gz"
+		if mt == types.OCILayerZStd {
+			file = d.Hex + ".tar.zst"
+		}
+		files = append(files, file)
+		if written[file] {
+			continue
+		}
+		written[file] = true
+		size, err := l.Size()
+		if err != nil {
+			return err
+		}
+		rc, err := l.Compressed()
+		if err != nil {
+			return err
+		}
+		err = writeTarEntry(tw, file, rc, size)
+		rc.Close()
+		if err != nil {
+			return err
+		}
+	}
+	manifest, err := json.Marshal([]tarball.Descriptor{{
+		Config:   cfgName.String(),
+		RepoTags: repoTags,
+		Layers:   files,
+	}})
+	if err != nil {
+		return err
+	}
+	if err := writeTarEntry(tw, "manifest.json", bytes.NewReader(manifest), int64(len(manifest))); err != nil {
+		return err
+	}
+	return tw.Close()
+}
+
+func writeTarEntry(tw *tar.Writer, name string, r io.Reader, size int64) error {
+	hdr := &tar.Header{Typeflag: tar.TypeReg, Name: name, Mode: 0o644, Size: size, ModTime: time.Unix(0, 0)}
+	if err := tw.WriteHeader(hdr); err != nil {
+		return err
+	}
+	n, err := io.Copy(tw, r)
+	if err == nil && n != size {
+		err = fmt.Errorf("%s: wrote %d bytes, want %d", name, n, size)
+	}
+	return err
 }

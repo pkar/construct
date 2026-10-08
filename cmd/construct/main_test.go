@@ -270,6 +270,99 @@ func TestBuildStampedTags(t *testing.T) {
 	}
 }
 
+func TestBuildFromFile(t *testing.T) {
+	t.Setenv("DOCKER_CONFIG", t.TempDir())
+	srv := httptest.NewServer(registry.New())
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+
+	dir := t.TempDir()
+	for _, n := range []string{"api-amd64", "api-arm64", "worker"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte(n), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	doc := `
+vcs: false
+labels: {team: core}
+images:
+  - name: api
+    platforms: [linux/amd64, linux/arm64]
+    tags: [REG/api:v1]
+    push: true
+    entrypoint: [/api]
+    layers:
+      - name: app
+        contents: ["api-{arch}:/api"]
+  - name: worker
+    platforms: linux/amd64
+    oci-layout: out/worker
+    layers:
+      - contents:
+          - {src: worker, dst: /worker, mode: "0500"}
+`
+	if err := os.WriteFile(filepath.Join(dir, "construct.yaml"), []byte(strings.ReplaceAll(doc, "REG", u.Host)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Run from elsewhere: paths resolve against the file's directory.
+	t.Chdir(t.TempDir())
+	file := filepath.Join(dir, "construct.yaml")
+
+	code, out, stderr := runCLI(t, "build", "-f", file)
+	if code != 0 {
+		t.Fatalf("build exit %d: %s", code, stderr)
+	}
+	if lines := strings.Fields(out); len(lines) != 2 || !strings.Contains(lines[0], "/api@sha256:") || !strings.HasPrefix(lines[1], "sha256:") {
+		t.Errorf("stdout = %q", out)
+	}
+	if !strings.Contains(stderr, "api: pushed ") || !strings.Contains(stderr, "worker: wrote OCI layout ") {
+		t.Errorf("stderr = %q", stderr)
+	}
+	idx, err := remote.Index(mustRepo(t, u.Host+"/api").Tag("v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if im, err := idx.IndexManifest(); err != nil || len(im.Manifests) != 2 {
+		t.Fatalf("api index = %+v, %v", im, err)
+	}
+
+	// Flags override the file for the selected image only.
+	code, _, stderr = runCLI(t, "build", "-f", file, "-label", "team=edge", "-env", "DEBUG=1", "worker")
+	if code != 0 {
+		t.Fatalf("build worker exit %d: %s", code, stderr)
+	}
+	if strings.Contains(stderr, "api") {
+		t.Errorf("building worker touched api: %s", stderr)
+	}
+	a, err := image.ReadLayout(filepath.Join(dir, "out", "worker"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cf, err := a.(v1.Image).ConfigFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cf.Config.Labels["team"] != "edge" || !slices.Contains(cf.Config.Env, "DEBUG=1") {
+		t.Errorf("worker config = %+v", cf.Config)
+	}
+
+	for _, args := range [][]string{
+		{"build", "-f", file, "nope"},
+		{"build", "-f", filepath.Join(dir, "missing.yaml")},
+		// Both images would write the same layout.
+		{"build", "-f", file, "-oci-layout", filepath.Join(dir, "same")},
+		// The api image has two platforms.
+		{"build", "-f", file, "-tarball", "x.tar", "api"},
+	} {
+		if code, _, stderr := runCLI(t, args...); code != 1 {
+			t.Errorf("%q: exit %d, want 1: %s", args, code, stderr)
+		}
+	}
+	if code, _, _ := runCLI(t, "build", "-oci-layout", t.TempDir(), "api"); code != 2 {
+		t.Errorf("image name without -f: exit %d, want 2", code)
+	}
+}
+
 func TestBuildLayoutThenPush(t *testing.T) {
 	t.Setenv("DOCKER_CONFIG", t.TempDir())
 	t.Setenv("SOURCE_DATE_EPOCH", "1700000000")
