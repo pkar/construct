@@ -61,6 +61,10 @@ func SelectPlatform(a Artifact, p v1.Platform) (v1.Image, error) {
 	}
 }
 
+// errEngineExited fails the tarball writer when the engine quits before
+// reading all of its input.
+var errEngineExited = errors.New("engine exited")
+
 // Load streams img, tagged with every tag, to `ENGINE load` and copies
 // the engine's output to out. engine is a path or a name on PATH.
 func Load(ctx context.Context, engine string, img v1.Image, tags []string, opts Options, out io.Writer) error {
@@ -85,14 +89,16 @@ func Load(ctx context.Context, engine string, img v1.Image, tags []string, opts 
 	}()
 	runErr := cmd.Run()
 	// Unblock the writer if the engine stopped reading early.
-	pr.CloseWithError(errors.New("engine exited"))
+	pr.CloseWithError(errEngineExited)
 	werr := <-writeErr
 	if werr != nil && runErr == nil {
 		return fmt.Errorf("load: %w", werr)
 	}
 	if runErr != nil {
 		msg := strings.TrimSpace(stderr.String())
-		if werr != nil && !errors.Is(werr, io.ErrClosedPipe) {
+		// A write that failed because the engine quit says nothing the
+		// engine's own exit status and message don't.
+		if werr != nil && !errors.Is(werr, io.ErrClosedPipe) && !errors.Is(werr, errEngineExited) {
 			return fmt.Errorf("load: %w", werr)
 		}
 		if msg != "" {
