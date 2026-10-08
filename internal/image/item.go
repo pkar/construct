@@ -57,6 +57,19 @@ type Item struct {
 type LayerSpec struct {
 	Name  string
 	Items []Item
+	// Run, when set, makes this a run layer: the script runs in a
+	// container started from the base image, and the files it changes
+	// become the layer. A run layer has no Items, and run layers must come
+	// before every other layer; see Spec.Runner.
+	Run *RunStep
+}
+
+// RunStep is a shell script run as root with /bin/sh -c.
+type RunStep struct {
+	Script string
+	// Env holds extra KEY=VALUE pairs for the script, on top of the base
+	// image's environment.
+	Env []string
 }
 
 // ParseAdd parses SRC:DST[:OPTIONS], where OPTIONS is a comma-separated

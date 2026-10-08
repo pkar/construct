@@ -81,13 +81,17 @@ func runLock(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if err != nil {
 		return err
 	}
-	// Keep entries for images that were not selected this time.
-	if old, err := image.ReadLock(*lockPath); err == nil && fls.NArg() > 0 {
-		for ref, d := range old.Bases {
-			if _, ok := fresh.Bases[ref]; !ok {
-				fresh.Bases[ref] = d
+	if old, err := image.ReadLock(*lockPath); err == nil {
+		// Keep entries for images that were not selected this time.
+		if fls.NArg() > 0 {
+			for ref, d := range old.Bases {
+				if _, ok := fresh.Bases[ref]; !ok {
+					fresh.Bases[ref] = d
+				}
 			}
 		}
+		// Run layer pins stay; a build replaces those whose base moved.
+		fresh.Runs = old.Runs
 	}
 	if err := fresh.Write(*lockPath); err != nil {
 		return err
@@ -162,7 +166,27 @@ func (s *lockState) pin(ctx context.Context, p *plan) error {
 	if pinned != base {
 		p.spec.Base, p.spec.BaseName = pinned, base
 	}
+	if p.runner != nil {
+		p.runner.Pins, p.runner.Locked = s.lock.Runs, s.locked
+	}
 	return nil
+}
+
+// record copies the run layers p used into the lock, unless -locked.
+func (s *lockState) record(p *plan) {
+	if s == nil || s.locked || p.runner == nil {
+		return
+	}
+	for id, pin := range p.runner.Used() {
+		if s.lock.Runs[id] == pin {
+			continue
+		}
+		if s.lock.Runs == nil {
+			s.lock.Runs = map[string]image.RunPin{}
+		}
+		s.lock.Runs[id] = pin
+		s.changed = true
+	}
 }
 
 func (s *lockState) save(stderr io.Writer) error {

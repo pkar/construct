@@ -15,7 +15,7 @@ import (
 type layerFlags struct{ layers []config.Layer }
 
 func (l *layerFlags) addItem(it image.Item) {
-	if len(l.layers) == 0 {
+	if len(l.layers) == 0 || l.layers[len(l.layers)-1].Run != "" {
 		l.layers = append(l.layers, config.Layer{})
 	}
 	last := &l.layers[len(l.layers)-1]
@@ -36,6 +36,24 @@ func (f layerFlag) Set(name string) error {
 		}
 	}
 	f.l.layers = append(f.l.layers, config.Layer{Name: name})
+	return nil
+}
+
+// runFlag makes the current layer a run layer, or starts an unnamed one
+// when the current layer already has files or a script.
+type runFlag struct{ l *layerFlags }
+
+func (f runFlag) String() string { return "" }
+
+func (f runFlag) Set(script string) error {
+	if strings.TrimSpace(script) == "" {
+		return fmt.Errorf("want a script")
+	}
+	n := len(f.l.layers)
+	if n == 0 || f.l.layers[n-1].Run != "" || len(f.l.layers[n-1].Contents) > 0 {
+		f.l.layers = append(f.l.layers, config.Layer{})
+	}
+	f.l.layers[len(f.l.layers)-1].Run = script
 	return nil
 }
 

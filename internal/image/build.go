@@ -15,6 +15,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
 
@@ -64,6 +65,28 @@ type Spec struct {
 	// LayerOptions.
 	Compression      string
 	CompressionLevel int
+
+	// Runner executes run layers. It is needed only when a layer has Run.
+	Runner Runner
+}
+
+// Runner runs the run layers of one platform's build in a container and
+// returns, for each step, an uncompressed layer tar file holding the
+// changes it made. The files must stay in place until the image has been
+// written.
+type Runner interface {
+	Run(ctx context.Context, req RunRequest) ([]string, error)
+}
+
+// RunRequest describes the run layers of one platform.
+type RunRequest struct {
+	// Image is the base image, pinned to its platform manifest digest, as
+	// a reference a container engine can pull.
+	Image    string
+	Platform v1.Platform
+	// Names are the layer names, one per step.
+	Names []string
+	Steps []RunStep
 }
 
 // Options holds registry settings shared by pulls and pushes.
@@ -109,7 +132,17 @@ func Build(ctx context.Context, spec Spec, opts Options) (v1.Image, error) {
 	if mt == types.DockerManifestSchema2 {
 		lo.MediaType = types.DockerLayer
 	}
-	for i, ls := range spec.Layers {
+	nruns, err := countRuns(spec.Layers)
+	if err != nil {
+		return nil, err
+	}
+	if nruns > 0 {
+		if img, err = appendRuns(ctx, img, spec, spec.Layers[:nruns], lo, opts); err != nil {
+			return nil, err
+		}
+	}
+	for i, ls := range spec.Layers[nruns:] {
+		i += nruns
 		name := ls.Name
 		if name == "" {
 			name = fmt.Sprintf("layer %d", i+1)
@@ -166,6 +199,105 @@ func Build(ctx context.Context, spec Spec, opts Options) (v1.Image, error) {
 		img = mutate.Annotations(img, anns).(v1.Image)
 	}
 	return img, nil
+}
+
+// layerName is the name a layer goes by in messages.
+func layerName(ls LayerSpec, i int) string {
+	if ls.Name != "" {
+		return ls.Name
+	}
+	return fmt.Sprintf("layer %d", i+1)
+}
+
+// countRuns returns how many run layers lead the list, and fails if a run
+// layer follows a file layer.
+func countRuns(layers []LayerSpec) (int, error) {
+	n := 0
+	for i, ls := range layers {
+		if ls.Run == nil {
+			continue
+		}
+		if len(ls.Items) > 0 {
+			return 0, fmt.Errorf("layer %s has both a script and files", layerName(ls, i))
+		}
+		if strings.TrimSpace(ls.Run.Script) == "" {
+			return 0, fmt.Errorf("layer %s: empty run script", layerName(ls, i))
+		}
+		if i != n {
+			return 0, fmt.Errorf("run layer %s comes after a file layer; run layers run on the base image, so list them first", layerName(ls, i))
+		}
+		n++
+	}
+	return n, nil
+}
+
+// appendRuns runs the run layers through spec.Runner and appends the
+// resulting layers to base.
+func appendRuns(ctx context.Context, base v1.Image, spec Spec, runs []LayerSpec, lo LayerOptions, opts Options) (v1.Image, error) {
+	if spec.Runner == nil {
+		return nil, fmt.Errorf("run layers need a container engine")
+	}
+	if spec.Base == "" || spec.Base == Scratch {
+		return nil, fmt.Errorf("run layer %s needs a base image with /bin/sh, not scratch", layerName(runs[0], 0))
+	}
+	ref, err := name.ParseReference(spec.Base, opts.nameOptions()...)
+	if err != nil {
+		return nil, fmt.Errorf("base %q: %w", spec.Base, err)
+	}
+	d, err := base.Digest()
+	if err != nil {
+		return nil, err
+	}
+	req := RunRequest{Image: engineRef(ref.Context(), d), Platform: spec.Platform}
+	for i, ls := range runs {
+		req.Names = append(req.Names, layerName(ls, i))
+		req.Steps = append(req.Steps, *ls.Run)
+	}
+	files, err := spec.Runner.Run(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if len(files) != len(runs) {
+		return nil, fmt.Errorf("runner returned %d layers for %d run steps", len(files), len(runs))
+	}
+	topts, err := lo.tarballOptions()
+	if err != nil {
+		return nil, err
+	}
+	img := base
+	for i, f := range files {
+		layer, err := tarball.LayerFromFile(f, topts...)
+		if err != nil {
+			return nil, fmt.Errorf("layer %s: %w", req.Names[i], err)
+		}
+		lmt, err := layer.MediaType()
+		if err != nil {
+			return nil, err
+		}
+		img, err = mutate.Append(img, mutate.Addendum{
+			Layer:     layer,
+			MediaType: lmt,
+			History: v1.History{
+				Created:   v1.Time{Time: spec.Created},
+				CreatedBy: "construct: layer " + req.Names[i] + ": run: " + runs[i].Run.Script,
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return img, nil
+}
+
+// engineRef names the image with digest d in repo the way container
+// engines expect: Docker Hub images as docker.io/... rather than
+// index.docker.io/....
+func engineRef(repo name.Repository, d v1.Hash) string {
+	reg := repo.RegistryStr()
+	if reg == name.DefaultRegistry {
+		reg = "docker.io"
+	}
+	return reg + "/" + repo.RepositoryStr() + "@" + d.String()
 }
 
 // baseAnnotations records which base image was used, as the OCI image
