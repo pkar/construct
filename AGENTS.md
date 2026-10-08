@@ -28,7 +28,8 @@ handling use `github.com/google/go-containerregistry`; build files use
 - `internal/check/`: structure tests run against the flattened filesystem
   and config.
 - `examples/construct.yaml` and `examples/run.yaml`: documented examples;
-  `TestExampleFile` and `TestRunExampleFile` keep them parsing. Keep it and README.md in step with the flags.
+  `TestExampleFile` and `TestRunExampleFile` keep them parsing. Keep them and README.md in step
+  with the flags.
 - `.github/workflows/`: `ci.yml` (Linux/macOS checks) and `release.yml`
   (tests, then `make dist` and `gh release create` on `v*` tags). Release
   targets live in `DIST_TARGETS` in the Makefile.
@@ -39,6 +40,9 @@ handling use `github.com/google/go-containerregistry`; build files use
 
 GitHub remote: `git@github.com:pkar/construct.git`. Do not push tags or
 publish releases unless asked.
+
+Run layers are the exception: they are cached by input hash and pinned
+in `construct.lock` rather than rebuilt byte for byte.
 
 Builds must stay reproducible: sorted tar entries, root ownership, and
 timestamps from `SOURCE_DATE_EPOCH` (default Unix epoch). Tests use an
