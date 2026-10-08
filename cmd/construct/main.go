@@ -16,8 +16,6 @@ import (
 	"strings"
 	"time"
 
-	v1 "github.com/google/go-containerregistry/pkg/v1"
-
 	"github.com/pkar/construct/internal/image"
 )
 
@@ -28,7 +26,7 @@ const usage = `construct builds OCI container images and pushes them to registri
 
 Usage:
   construct build [flags]          build an image from a base and local files
-  construct push [flags] DIR REF   push the image in an OCI layout to REF
+  construct push [flags] DIR REF   push the image or index in an OCI layout to REF
   construct version                print the version
 
 Run 'construct build -h' or 'construct push -h' for flags.
@@ -84,7 +82,7 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	fs.SetOutput(stderr)
 	var (
 		base       = fs.String("base", image.Scratch, "base image reference, or scratch")
-		platform   = fs.String("platform", "linux/"+runtime.GOARCH, "target platform as os/arch[/variant]")
+		platform   = fs.String("platform", "linux/"+runtime.GOARCH, "target `platforms` as os/arch[/variant], comma-separated; several build an image index")
 		tag        = fs.String("tag", "", "image reference, e.g. registry.example.com/team/app:v1")
 		push       = fs.Bool("push", false, "push the image to -tag")
 		layoutDir  = fs.String("oci-layout", "", "write the image to an OCI layout directory")
@@ -98,7 +96,7 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		env        repeated
 		labels     repeated
 	)
-	fs.Var(&adds, "add", "copy host `SRC:DST` into the image (repeatable)")
+	fs.Var(&adds, "add", "copy host `SRC:DST` into the image (repeatable); {os}, {arch}, {variant} in SRC expand per platform")
 	fs.Var(&entrypoint, "entrypoint", `entrypoint as a JSON array or space-separated words`)
 	fs.Var(&cmd, "cmd", `default arguments as a JSON array or space-separated words`)
 	fs.Var(&env, "env", "set `KEY=VALUE` in the environment (repeatable)")
@@ -120,13 +118,16 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return usageErr(fs, "-push and -tarball need -tag")
 	}
 
-	plat, err := v1.ParsePlatform(*platform)
+	platforms, err := image.ParsePlatforms(*platform)
 	if err != nil {
-		return fmt.Errorf("platform %q: %w", *platform, err)
+		return err
+	}
+	if len(platforms) > 1 && *tarFile != "" {
+		return usageErr(fs, "-tarball holds one platform; use -push or -oci-layout for several")
 	}
 	spec := image.Spec{
 		Base:       *base,
-		Platform:   *plat,
+		Platform:   platforms[0],
 		Entrypoint: entrypoint.list,
 		Cmd:        cmd.list,
 		Env:        env,
@@ -155,7 +156,12 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 
 	opts := image.Options{Insecure: *insecure}
-	img, err := image.Build(ctx, spec, opts)
+	var img image.Artifact
+	if len(platforms) == 1 {
+		img, err = image.Build(ctx, spec, opts)
+	} else {
+		img, err = image.BuildIndex(ctx, spec, platforms, opts)
+	}
 	if err != nil {
 		return err
 	}
@@ -194,7 +200,7 @@ func runPush(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	fs.SetOutput(stderr)
 	insecure := fs.Bool("insecure", false, "allow plain HTTP and unverified TLS registries")
 	fs.Usage = func() {
-		fmt.Fprint(fs.Output(), "Usage: construct push [flags] DIR REF\n\nPush the single image in OCI layout DIR to registry reference REF.\n\nFlags:\n")
+		fmt.Fprint(fs.Output(), "Usage: construct push [flags] DIR REF\n\nPush the single image or image index in OCI layout DIR to registry reference REF.\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	if err := parse(fs, args); err != nil {

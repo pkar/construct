@@ -219,6 +219,152 @@ func TestLayoutRoundTrip(t *testing.T) {
 	}
 }
 
+// fileInLayer returns the contents of name (no leading slash) in layer.
+func fileInLayer(t *testing.T, layer v1.Layer, name string) string {
+	t.Helper()
+	rc, err := layer.Uncompressed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	for _, e := range readTarNoChecks(t, rc) {
+		if e.name == name {
+			return e.body
+		}
+	}
+	t.Fatalf("%s not in layer", name)
+	return ""
+}
+
+func TestBuildIndex(t *testing.T) {
+	ctx := context.Background()
+	host := testRegistry(t)
+	src := t.TempDir()
+	platforms, err := ParsePlatforms("linux/amd64, linux/arm64/v8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, arch := range []string{"amd64", "arm64"} {
+		writeFile(t, filepath.Join(src, "base-linux-"+arch), "base "+arch, 0o644)
+		writeFile(t, filepath.Join(src, "app-linux-"+arch), "app "+arch, 0o755)
+	}
+
+	// A multi-platform base, then an app index built on top of it.
+	base, err := BuildIndex(ctx, Spec{
+		Base: Scratch,
+		Adds: []Add{{Src: filepath.Join(src, "base-{os}-{arch}"), Dst: "/base"}},
+	}, platforms, anonymous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseRef := host + "/base:multi"
+	if _, err := Push(ctx, base, baseRef, anonymous); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := BuildIndex(ctx, Spec{
+		Base:       baseRef,
+		Adds:       []Add{{Src: filepath.Join(src, "app-{os}-{arch}"), Dst: "/app"}},
+		Entrypoint: []string{"/app"},
+	}, platforms, anonymous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pushed, err := Push(ctx, idx, host+"/app:multi", anonymous)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := remote.Index(pushed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mt, _ := got.MediaType(); mt != types.OCIImageIndex {
+		t.Errorf("index media type = %s", mt)
+	}
+	im, err := got.IndexManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(im.Manifests) != 2 {
+		t.Fatalf("index has %d manifests, want 2", len(im.Manifests))
+	}
+	for i, desc := range im.Manifests {
+		want := platforms[i]
+		if desc.Platform == nil || desc.Platform.OS != want.OS || desc.Platform.Architecture != want.Architecture || desc.Platform.Variant != want.Variant {
+			t.Errorf("manifest %d platform = %+v, want %+v", i, desc.Platform, want)
+		}
+		img, err := got.Image(desc.Digest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		layers, err := img.Layers()
+		if err != nil || len(layers) != 2 {
+			t.Fatalf("%s: layers = %d, %v; want base + app", want.Architecture, len(layers), err)
+		}
+		if body := fileInLayer(t, layers[0], "base"); body != "base "+want.Architecture {
+			t.Errorf("%s: base layer has %q", want.Architecture, body)
+		}
+		if body := fileInLayer(t, layers[1], "app"); body != "app "+want.Architecture {
+			t.Errorf("%s: app layer has %q", want.Architecture, body)
+		}
+	}
+
+	// The index survives an OCI layout round trip.
+	dir := filepath.Join(t.TempDir(), "layout")
+	if err := WriteLayout(dir, idx, "app:multi"); err != nil {
+		t.Fatal(err)
+	}
+	read, err := ReadLayout(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := read.(v1.ImageIndex); !ok {
+		t.Fatalf("ReadLayout returned %T, want an index", read)
+	}
+	if d, _ := read.Digest(); d.String() != pushed.DigestStr() {
+		t.Errorf("layout digest %s, want %s", d, pushed.DigestStr())
+	}
+
+	if err := WriteTarball(filepath.Join(t.TempDir(), "x.tar"), idx, "app:multi", anonymous); err == nil {
+		t.Error("want error writing an index as a tarball")
+	}
+}
+
+func TestBuildIndexRejectsDuplicatePlatform(t *testing.T) {
+	platforms, err := ParsePlatforms("linux/amd64,linux/amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BuildIndex(context.Background(), Spec{Base: Scratch}, platforms, anonymous); err == nil {
+		t.Fatal("want error for duplicate platform")
+	}
+}
+
+func TestParsePlatforms(t *testing.T) {
+	for _, bad := range []string{"", ",", "linux", "a/b/c/d"} {
+		if _, err := ParsePlatforms(bad); err == nil {
+			t.Errorf("ParsePlatforms(%q) succeeded", bad)
+		}
+	}
+}
+
+func TestBaseWrongPlatform(t *testing.T) {
+	ctx := context.Background()
+	host := testRegistry(t)
+	base, err := Build(ctx, Spec{Base: Scratch, Platform: v1.Platform{OS: "linux", Architecture: "amd64"}}, anonymous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := host + "/amd64-only:v1"
+	if _, err := Push(ctx, base, ref, anonymous); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Build(ctx, Spec{Base: ref, Platform: v1.Platform{OS: "linux", Architecture: "arm64"}}, anonymous)
+	if err == nil {
+		t.Fatal("want error building arm64 on an amd64-only base")
+	}
+}
+
 func TestWriteTarball(t *testing.T) {
 	img, err := Build(context.Background(), Spec{Base: Scratch, Platform: v1.Platform{OS: "linux", Architecture: "amd64"}}, anonymous)
 	if err != nil {

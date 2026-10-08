@@ -4,7 +4,7 @@ package image
 
 import (
 	"archive/tar"
-	"bytes"
+	"bufio"
 	"fmt"
 	"io"
 	"io/fs"
@@ -53,36 +53,53 @@ type entry struct {
 // Layer packs adds into a single deterministic layer. Entries are sorted,
 // owned by root, and stamped with mtime, so identical inputs give identical
 // digests. mediaType must be types.OCILayer or types.DockerLayer.
+//
+// The file list is fixed when Layer is called, but file contents are
+// streamed from disk each time the layer is read (to hash, compress, and
+// upload it), so a layer never has to fit in memory. Sources must not change
+// until the image has been written.
 func Layer(adds []Add, mtime time.Time, mediaType types.MediaType) (v1.Layer, error) {
-	data, err := layerTar(adds, mtime)
+	entries, err := collectEntries(adds)
 	if err != nil {
 		return nil, err
 	}
 	opener := func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(data)), nil
+		pr, pw := io.Pipe()
+		go func() {
+			// If the reader stops early, writes fail with io.ErrClosedPipe
+			// and this goroutine exits.
+			pw.CloseWithError(writeTar(pw, entries, mtime))
+		}()
+		return pr, nil
 	}
 	return tarball.LayerFromOpener(opener, tarball.WithMediaType(mediaType))
 }
 
-// layerTar returns the uncompressed tar stream for adds.
-func layerTar(adds []Add, mtime time.Time) ([]byte, error) {
-	entries := map[string]entry{}
+// collectEntries resolves adds into the sorted list of layer entries.
+func collectEntries(adds []Add) ([]entry, error) {
+	byName := map[string]entry{}
 	for _, a := range adds {
-		if err := collect(entries, a); err != nil {
+		if err := collect(byName, a); err != nil {
 			return nil, err
 		}
 	}
-
-	names := make([]string, 0, len(entries))
-	for n := range entries {
+	names := make([]string, 0, len(byName))
+	for n := range byName {
 		names = append(names, n)
 	}
 	sort.Strings(names)
+	entries := make([]entry, len(names))
+	for i, n := range names {
+		entries[i] = byName[n]
+	}
+	return entries, nil
+}
 
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	for _, n := range names {
-		e := entries[n]
+// writeTar writes the uncompressed tar stream for entries to w.
+func writeTar(w io.Writer, entries []entry, mtime time.Time) error {
+	bw := bufio.NewWriterSize(w, 64<<10)
+	tw := tar.NewWriter(bw)
+	for _, e := range entries {
 		hdr := &tar.Header{
 			Typeflag: e.typ,
 			Name:     e.name,
@@ -99,18 +116,18 @@ func layerTar(adds []Add, mtime time.Time) ([]byte, error) {
 			hdr.Size = e.size
 		}
 		if err := tw.WriteHeader(hdr); err != nil {
-			return nil, err
+			return err
 		}
 		if e.typ == tar.TypeReg {
 			if err := copyFile(tw, e.src, e.size); err != nil {
-				return nil, err
+				return err
 			}
 		}
 	}
 	if err := tw.Close(); err != nil {
-		return nil, err
+		return err
 	}
-	return buf.Bytes(), nil
+	return bw.Flush()
 }
 
 func copyFile(w io.Writer, name string, size int64) error {
