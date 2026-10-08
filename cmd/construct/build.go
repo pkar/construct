@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/pkar/construct/internal/check"
 	"github.com/pkar/construct/internal/config"
 	"github.com/pkar/construct/internal/image"
+	runpkg "github.com/pkar/construct/internal/run"
 	"github.com/pkar/construct/internal/vcs"
 )
 
@@ -61,7 +63,9 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		users      repeated
 		runTests   = fs.Bool("test", true, "run the build file's tests before writing outputs")
 		lockPath   = fs.String("lock", "", "pin base images to the digests in lock `file`, adding missing ones (default\nconstruct.lock next to -f, when it exists)")
-		locked     = fs.Bool("locked", false, "fail if a base image is missing from the lock file; never update it")
+		locked     = fs.Bool("locked", false, "fail if a base image or run layer is missing from the lock file, or a run layer\ncomes out different; never update the lock")
+		runEngine  = fs.String("run-engine", "", "container `engine` for run layers: container (Apple), docker, or podman (default: the\nfirst installed one that can run the platform)")
+		refresh    = fs.Bool("refresh", false, "rerun run layers instead of using cached results, and update the lock file")
 		entrypoint optionalList
 		cmd        optionalList
 		layers     layerFlags
@@ -76,6 +80,7 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	fs.Var(itemFlag{&layers, image.ParseAdd}, "add", "copy host `SRC:DST[:OPTIONS]` into the image (repeatable); {os}, {arch}, {variant} in SRC\nexpand per platform. OPTIONS: mode=OCTAL,dirmode=OCTAL,owner=UID[:GID]")
 	fs.Var(itemFlag{&layers, image.ParseMkdir}, "mkdir", "create directory `DST[:OPTIONS]` (repeatable). OPTIONS: mode=OCTAL,owner=UID[:GID]")
 	fs.Var(itemFlag{&layers, image.ParseSymlink}, "symlink", "create symlink `DST:TARGET` (repeatable)")
+	fs.Var(runFlag{&layers}, "run", "run shell `SCRIPT` as root in a container from the base image; the files it changes\nbecome the layer (repeatable; before any -add)")
 	fs.Var(&users, "add-user", "add user `NAME:UID[:GID[:HOME]]` to /etc/passwd and /etc/group, with a home directory\n(repeatable; scratch base only)")
 	fs.Var(&tags, "tag", "image `reference`, e.g. registry.example.com/team/app:v1 (repeatable); {git.commit}, {git.short},\n{git.branch}, {git.tag}, and {env.NAME} expand here and in label and annotation values")
 	fs.Var(&entrypoint, "entrypoint", `entrypoint as a JSON array or space-separated words`)
@@ -125,6 +130,8 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			over.Load = load
 		case "engine":
 			over.Engine = engine
+		case "run-engine":
+			over.RunEngine = runEngine
 		case "workdir":
 			over.WorkDir = workdir
 		case "user":
@@ -163,6 +170,9 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	})
 	if err != nil {
 		return err
+	}
+	if *refresh && *locked {
+		return usageErr(fs, "-refresh and -locked conflict: -locked never updates the lock file")
 	}
 
 	var (
@@ -204,6 +214,9 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		p, err := newPlan(im, dir, false, stderr)
 		if p != nil {
 			p.skipTests = !*runTests
+			if p.runner != nil {
+				p.runner.Refresh = *refresh
+			}
 		}
 		var ue usageError
 		switch {
@@ -231,7 +244,14 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return err
 	}
 	for _, p := range plans {
-		if err := p.run(ctx, stdout, stderr); err != nil {
+		err := p.run(ctx, stdout, stderr)
+		// Record run layers even when a later step failed: they are
+		// cached, and the lock should match the cache.
+		lock.record(p)
+		if serr := lock.save(stderr); err == nil {
+			err = serr
+		}
+		if err != nil {
 			return p.errorf("%w", err)
 		}
 	}
@@ -257,6 +277,7 @@ type plan struct {
 	checks    []check.Check
 	skipTests bool
 	opts      image.Options
+	runner    *runpkg.Runner // nil without run layers
 }
 
 func (p *plan) label() string {
@@ -362,6 +383,34 @@ func newPlan(im config.Image, dir string, testOnly bool, stderr io.Writer) (*pla
 		}
 		p.spec.ExposedPorts = append(p.spec.ExposedPorts, norm)
 	}
+	// Run layers lead; they run on the bare base image.
+	nruns := 0
+	for i, l := range im.Layers {
+		ls := image.LayerSpec{Name: l.Name}
+		lname := l.Name
+		if lname == "" {
+			lname = fmt.Sprintf("layer %d", i+1)
+		}
+		switch {
+		case l.Run != "" && len(l.Contents) > 0:
+			return p, usagef("layer %s has both run and contents; split it into two layers", lname)
+		case l.Run == "" && len(l.Env) > 0:
+			return p, usagef("layer %s: env applies only to run layers", lname)
+		case l.Run != "":
+			if i != nruns {
+				return p, usagef("run layer %s comes after a file layer; run layers run on the base image, so list them first", lname)
+			}
+			nruns++
+			ls.Run = &image.RunStep{Script: l.Run, Env: l.Env}
+		}
+		for _, it := range l.Contents {
+			ls.Items = append(ls.Items, it.Item)
+		}
+		p.spec.Layers = append(p.spec.Layers, ls)
+	}
+	if nruns > 0 && p.spec.Base == image.Scratch {
+		return p, usagef("run layers need a base image with /bin/sh, not scratch")
+	}
 	if r := im.Rootfs.Image(); !r.Empty() {
 		if r.WritesUsers() && p.spec.Base != image.Scratch {
 			return p, usagef("-skeleton and -add-user write /etc/passwd, which would replace the base image's; use them with a scratch base")
@@ -370,17 +419,15 @@ func newPlan(im config.Image, dir string, testOnly bool, stderr io.Writer) (*pla
 		if err != nil {
 			return p, err
 		}
-		p.spec.Layers = append(p.spec.Layers, ls)
-	}
-	for _, l := range im.Layers {
-		ls := image.LayerSpec{Name: l.Name}
-		for _, it := range l.Contents {
-			ls.Items = append(ls.Items, it.Item)
-		}
-		p.spec.Layers = append(p.spec.Layers, ls)
+		p.spec.Layers = slices.Insert(p.spec.Layers, nruns, ls)
 	}
 	if p.spec.Created, err = buildTime(); err != nil {
 		return p, err
+	}
+	if nruns > 0 {
+		if err := p.newRunner(deref(im.RunEngine), stderr); err != nil {
+			return p, err
+		}
 	}
 
 	p.spec.Labels = copyMap(im.Labels)
@@ -400,6 +447,33 @@ func newPlan(im config.Image, dir string, testOnly bool, stderr io.Writer) (*pla
 		return p, fmt.Errorf("annotation %w", err)
 	}
 	return p, nil
+}
+
+// newRunner sets up the runner for the plan's run layers. Without a named
+// engine, a missing engine is reported only if a layer is not cached.
+func (p *plan) newRunner(engine string, stderr io.Writer) error {
+	var engines []runpkg.Engine
+	if engine != "" {
+		var err error
+		if engines, err = runpkg.FindEngines(engine); err != nil {
+			return err
+		}
+	} else {
+		engines, _ = runpkg.FindEngines("")
+	}
+	cache, err := runpkg.DefaultCacheDir()
+	if err != nil {
+		return err
+	}
+	p.runner = &runpkg.Runner{
+		Engines:  engines,
+		CacheDir: cache,
+		Created:  p.spec.Created,
+		Log:      stderr,
+		Prefix:   p.label(),
+	}
+	p.spec.Runner = p.runner
+	return nil
 }
 
 // build builds the image or index in memory.

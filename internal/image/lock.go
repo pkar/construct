@@ -19,6 +19,16 @@ type Lock struct {
 	// Bases maps each base reference, as written in the build, to the
 	// digest of its manifest or image index.
 	Bases map[string]string `json:"bases"`
+	// Runs pins the output of run layers, keyed by IMAGE/LAYER/PLATFORM.
+	Runs map[string]RunPin `json:"runs,omitempty"`
+}
+
+// RunPin records what a run layer produced from a given set of inputs.
+type RunPin struct {
+	// Inputs is a hash of the base image digest, platform, and scripts.
+	Inputs string `json:"inputs"`
+	// Layer is the diff ID (uncompressed digest) of the layer.
+	Layer string `json:"layer"`
 }
 
 const lockVersion = 1

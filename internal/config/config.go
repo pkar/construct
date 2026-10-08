@@ -35,6 +35,9 @@ type Image struct {
 	Tarball   *string `yaml:"tarball"`
 	Load      *bool   `yaml:"load"`
 	Engine    *string `yaml:"engine"`
+	// RunEngine names the engine for run layers: container, docker, or
+	// podman. Unset tries each in turn.
+	RunEngine *string `yaml:"run-engine"`
 	Insecure  *bool   `yaml:"insecure"`
 	VCS       *bool   `yaml:"vcs"`
 
@@ -85,10 +88,14 @@ func (r *Rootfs) Image() image.Rootfs {
 	return out
 }
 
-// Layer is a named group of items.
+// Layer is a named group of items, or a run layer: a shell script run in
+// a container from the base image, whose changes become the layer. Env
+// applies to the script only.
 type Layer struct {
-	Name     string `yaml:"name"`
-	Contents []Item `yaml:"contents"`
+	Name     string  `yaml:"name"`
+	Contents []Item  `yaml:"contents"`
+	Run      string  `yaml:"run"`
+	Env      EnvList `yaml:"env"`
 }
 
 // Item is one layer entry. In YAML it is either the SRC:DST[:OPTIONS]
@@ -362,6 +369,7 @@ func Merge(base, over Image) Image {
 	set(&out.Tarball, over.Tarball)
 	set(&out.Load, over.Load)
 	set(&out.Engine, over.Engine)
+	set(&out.RunEngine, over.RunEngine)
 	set(&out.Insecure, over.Insecure)
 	set(&out.VCS, over.VCS)
 	set(&out.Compression, over.Compression)
