@@ -117,7 +117,7 @@ while [ "$#" -gt 0 ]; do
 done
 case "$url" in
  */releases/latest)
- [ "$MODE" != no-gh-private ] || exit 22
+ [ "$MODE" != no-gh-unreachable ] || exit 22
  printf 'https://github.com/pkar/construct/releases/tag/v1.2.3';;
  */releases/download/v1.2.3/checksums.txt) cp "$ROOT/checksums" "$out";;
  */releases/download/v1.2.3/construct-*) cp "$ROOT/payload" "$out";;
@@ -204,7 +204,7 @@ func TestInstallFailures(t *testing.T) {
 		{"no-hash", "Linux", "x86_64", "requires sha256sum or shasum"},
 		{"invalid-tag", "Linux", "x86_64", "invalid release tag"},
 		{"resolve-failure", "Linux", "x86_64", "could not resolve"},
-		{"no-gh-private", "Linux", "x86_64", "gh auth login"},
+		{"no-gh-unreachable", "Linux", "x86_64", "gh auth login"},
 		{"gh", "FreeBSD", "amd64", "unsupported OS"},
 	} {
 		t.Run(tc.mode+"-"+tc.system, func(t *testing.T) {
