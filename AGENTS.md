@@ -13,6 +13,10 @@ container daemon, and writes them to a registry, an OCI layout, or a
 - `.github/workflows/`: `ci.yml` (Linux/macOS checks) and `release.yml`
   (tests, then `make dist` and `gh release create` on `v*` tags). Release
   targets live in `DIST_TARGETS` in the Makefile.
+- `install.sh`: installs the latest release, verifying `checksums.txt`, or
+  builds the tag with Go on other targets. Uses a logged-in `gh` (the repo
+  is private) and falls back to anonymous `curl`. `install_test.go` runs it
+  against fake `gh`/`curl`/`go`; keep asset names in step with `make dist`.
 
 GitHub remote: `git@github.com:pkar/construct.git`. Do not push tags or
 publish releases unless asked.

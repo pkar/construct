@@ -11,6 +11,21 @@ inputs give the same digest.
 
 ## Install
 
+With the installer (needs `gh` logged in to an account that can read this
+private repository, or plain `curl` once the repository is public):
+
+```sh
+gh api repos/pkar/construct/contents/install.sh -H 'Accept: application/vnd.github.raw' > install.sh
+sh install.sh
+```
+
+Or run `sh install.sh` from a clone. It resolves the latest release once and
+fetches everything from that tag. On Linux amd64/arm64 and macOS arm64 it
+downloads the binary and checks it against the release's `checksums.txt`; on
+other Linux/macOS targets it builds that tag with Go. It installs to
+`~/.local/bin`; set `CONSTRUCT_INSTALL_DIR` to choose another directory.
+Checksums catch corrupted downloads; they are not independent signatures.
+
 From source:
 
 ```sh
@@ -20,11 +35,8 @@ make install PREFIX=/opt/construct   # installs to /opt/construct/bin
 ```
 
 Tagged releases publish `construct-linux-amd64`, `construct-linux-arm64`,
-`construct-darwin-arm64`, and a `checksums.txt` of SHA-256 sums on the
-GitHub releases page. Check the download against `checksums.txt`
-(`shasum -a 256 -c checksums.txt --ignore-missing`), make it executable, and
-put it on your `PATH`. The checksums only catch corrupted downloads; they are
-not a signature.
+`construct-darwin-arm64`, and `checksums.txt` on the GitHub releases page,
+if you would rather download by hand.
 
 ## Examples
 
