@@ -10,6 +10,10 @@ Builds are reproducible. Tar entries are sorted, owned by root unless you
 say otherwise, and stamped with `SOURCE_DATE_EPOCH` (the Unix epoch when
 unset), so the same inputs give the same digest.
 
+The one exception is run layers (`-run`), which install packages or run
+any other script inside the base image. They need a container engine and
+are cached and pinned instead; see [Run layers](#run-layers).
+
 ## Install
 
 With the installer (needs `gh` logged in to an account that can read this
@@ -155,6 +159,78 @@ replace the base image's. With `system`, the bundle and zone data come from
 whichever machine runs the build, so pin them with a path if two machines
 must produce the same digest.
 
+### Run layers
+
+A run layer runs a shell script in a container started from the base image.
+Whatever files the script changes become the layer: packages installed
+with apt, apk, or dnf, a binary fetched with curl, an edited config file,
+or a deleted file.
+
+```yaml
+base: ubuntu:24.04
+platforms: [linux/arm64, linux/amd64]
+layers:
+  - name: deps
+    run: |
+      apt-get update
+      apt-get install -y --no-install-recommends curl ca-certificates
+      rm -rf /var/lib/apt/lists/* /var/log/apt /var/log/dpkg.log
+    env: {DEBIAN_FRONTEND: noninteractive}
+  - name: app
+    contents: ["dist/app-linux-{arch}:/usr/local/bin/app"]
+```
+
+On the command line: `-layer deps -run 'apk add --no-cache curl'`.
+
+For each platform, construct:
+
+1. Starts a container from the base image, pinned to that platform's
+   digest, in the first engine that can run it: Apple's `container`, then
+   `docker`, then `podman`. Apple's `container` runs amd64 images on Apple
+   silicon, and Docker or Podman can do the same with emulation set up. Set
+   `-run-engine` (`run-engine:` in a build file) to pick one.
+2. Exports the container's filesystem, runs each script as root with
+   `/bin/sh -c`, and exports it again after each script.
+3. Diffs the exports into a layer: added and changed files (by contents,
+   mode, owner, link target, and extended attributes, not timestamps),
+   their parent directories, and whiteouts for deleted paths. Files the
+   engine itself manages, like `/etc/hosts`, are in both exports and drop
+   out, as does anything under `/proc`, `/sys`, and `/dev`.
+
+Rules and limits:
+
+- Run layers must come before every file layer, because they run on the
+  bare base image. A `rootfs` layer goes after them.
+- The base needs `/bin/sh` and `sleep`, so `scratch` and distroless bases
+  can't have run layers.
+- `env:` sets variables for the script only, not the image.
+- What the script leaves behind is in the layer, including logs and
+  caches. Clean up in the same script.
+
+#### Caching and the lock file
+
+Running `apt-get update` twice gives different results, so run layers are
+cached rather than rebuilt. The cache key covers the base digest, the
+platform, `SOURCE_DATE_EPOCH`, and the scripts up to and including that
+layer. The cache lives in the user cache directory (`~/Library/Caches/construct`
+on macOS, `~/.cache/construct` on Linux), or in `$CONSTRUCT_CACHE_DIR`. A
+build whose run layers are all cached doesn't start an engine at all.
+
+With a lock file, a build also records each run layer's inputs and the
+digest of its contents under `runs` in `construct.lock`. `-locked` then
+fails if:
+
+- a run layer is missing from the lock;
+- its base or scripts changed since the lock was written; or
+- rerunning it (on a machine without the cache) produces different files.
+
+`-refresh` ignores the cache, reruns every run layer, and updates the lock.
+Whether a rerun gives the same layer depends on the script. An `apk add`
+on a pinned Alpine base reproduced the same digest in testing. Package
+managers that write logs or timestamps (apt and dpkg write
+`/var/log/apt`, `/var/log/dpkg.log`, and `*-old` backups) won't, unless the
+script deletes those files.
+
 ## Image config
 
 | Flag | Meaning |
@@ -233,6 +309,9 @@ git add construct.lock
 construct build -f construct.yaml       # builds on the locked digests
 construct build -f construct.yaml -locked   # in CI: fail if a base is not locked
 ```
+
+The lock also pins run layers; see
+[Caching and the lock file](#caching-and-the-lock-file).
 
 `construct.lock` maps each base reference to the digest its registry served
 when you ran `lock`. Run `lock` again to move to newer bases. When the build
@@ -320,7 +399,8 @@ that already exists for the tag.
 - Layer contents are streamed from disk whenever a layer is hashed or
   uploaded, so large trees are not held in memory. Sources must not change
   while `construct` runs.
-- Hard links are stored as separate files. Devices, sockets, and FIFOs are
-  rejected.
+- Hard links in `-add` sources are stored as separate files, and devices,
+  sockets, and FIFOs are rejected. Run layers keep hard links, devices,
+  and FIFOs as the engine exports them.
 - Image signing and SBOMs are not built in. Use `cosign` or `syft` on the
   pushed digest.

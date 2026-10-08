@@ -1,0 +1,41 @@
+# Run layers: construct build -f examples/run.yaml
+#
+# Each run layer runs its script as root in a container started from the
+# base image (Apple container, docker, or podman), and the files the script
+# changes become the layer. Run layers come before file layers. Results are
+# cached, and construct.lock pins them; see README.md.
+
+base: ubuntu:24.04
+platforms: [linux/arm64, linux/amd64]
+tags: [registry.example.com/team/tools:latest]
+push: true
+
+# container (Apple), docker, or podman. Unset tries each in that order and
+# uses the first that can run the platform.
+# run-engine: podman
+
+layers:
+  - name: packages
+    run: |
+      apt-get update
+      apt-get install -y --no-install-recommends curl ca-certificates jq
+      # Logs and package lists would make the layer differ on every run.
+      rm -rf /var/lib/apt/lists/* /var/log/apt /var/log/dpkg.log
+    env: {DEBIAN_FRONTEND: noninteractive}
+
+  - name: tweaks
+    run: |
+      useradd --uid 10001 --create-home app
+      rm -f /etc/update-motd.d/*
+
+  # A file layer goes on top as usual. {arch} expands per platform.
+  - name: app
+    contents:
+      - dist/app-linux-{arch}:/usr/local/bin/app:mode=0755
+
+user: app
+entrypoint: [/usr/local/bin/app]
+
+tests:
+  - {file: /usr/bin/curl, type: file}
+  - {file: /home/app, type: dir, owner: "10001"}

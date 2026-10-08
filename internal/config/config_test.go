@@ -199,6 +199,23 @@ func TestExampleFile(t *testing.T) {
 	}
 }
 
+func TestRunExampleFile(t *testing.T) {
+	f, err := Load(filepath.Join("..", "..", "examples", "run.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	images, err := f.Select(nil)
+	if err != nil || len(images) != 1 {
+		t.Fatalf("images = %d, %v", len(images), err)
+	}
+	im := images[0]
+	if len(im.Layers) != 3 || !strings.HasPrefix(im.Layers[0].Run, "apt-get update\n") ||
+		len(im.Layers[0].Env) != 1 || im.Layers[0].Env[0] != "DEBIAN_FRONTEND=noninteractive" ||
+		im.Layers[1].Run == "" || len(im.Layers[2].Contents) != 1 || im.Layers[2].Run != "" {
+		t.Errorf("layers = %+v", im.Layers)
+	}
+}
+
 func TestParseRootfs(t *testing.T) {
 	doc := "rootfs: {skeleton: true, users: [\"a:1\"], ca-certs: certs/ca.pem, tzdata: system}\n" +
 		"images:\n  - name: x\n    rootfs: {users: [\"b:2\"]}\n"
