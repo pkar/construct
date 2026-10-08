@@ -5,20 +5,21 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/pkar/construct/internal/config"
 	"github.com/pkar/construct/internal/image"
 )
 
 // layerFlags collects -layer, -add, -mkdir, and -symlink in command-line
 // order. Items go into the layer started by the latest -layer, or into an
 // unnamed first layer if no -layer came before them.
-type layerFlags struct{ layers []image.LayerSpec }
+type layerFlags struct{ layers []config.Layer }
 
 func (l *layerFlags) addItem(it image.Item) {
 	if len(l.layers) == 0 {
-		l.layers = append(l.layers, image.LayerSpec{})
+		l.layers = append(l.layers, config.Layer{})
 	}
 	last := &l.layers[len(l.layers)-1]
-	last.Items = append(last.Items, it)
+	last.Contents = append(last.Contents, config.Item{Item: it})
 }
 
 type layerFlag struct{ l *layerFlags }
@@ -34,7 +35,7 @@ func (f layerFlag) Set(name string) error {
 			return fmt.Errorf("layer %q given twice", name)
 		}
 	}
-	f.l.layers = append(f.l.layers, image.LayerSpec{Name: name})
+	f.l.layers = append(f.l.layers, config.Layer{Name: name})
 	return nil
 }
 

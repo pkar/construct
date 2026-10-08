@@ -2,7 +2,10 @@ module github.com/pkar/construct
 
 go 1.26.0
 
-require github.com/google/go-containerregistry v0.22.1
+require (
+	github.com/google/go-containerregistry v0.22.1
+	gopkg.in/yaml.v3 v3.0.1
+)
 
 require (
 	github.com/docker/cli v29.7.2+incompatible // indirect

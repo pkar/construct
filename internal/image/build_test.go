@@ -1,6 +1,7 @@
 package image
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http/httptest"
@@ -529,8 +530,23 @@ func TestBaseWrongPlatform(t *testing.T) {
 	}
 }
 
+func mustDigest(t *testing.T, a Artifact) v1.Hash {
+	t.Helper()
+	d, err := a.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
 func TestWriteTarball(t *testing.T) {
-	img, err := Build(context.Background(), Spec{Base: Scratch, Platform: v1.Platform{OS: "linux", Architecture: "amd64"}}, anonymous)
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "app"), "binary", 0o755)
+	img, err := Build(context.Background(), Spec{
+		Base:     Scratch,
+		Platform: v1.Platform{OS: "linux", Architecture: "amd64"},
+		Layers:   append(copies(filepath.Join(src, "app"), "/app"), copies(filepath.Join(src, "app"), "/app")...),
+	}, anonymous)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,6 +561,38 @@ func TestWriteTarball(t *testing.T) {
 	}
 	if len(m) != 1 || !slices.Equal(m[0].RepoTags, tags) {
 		t.Errorf("tarball manifest = %+v, want one image tagged %q", m, tags)
+	}
+	// The tarball loads back with the same config and layers. (Docker
+	// tarballs hold no manifest, so the reader makes up its own.)
+	loaded, err := tarball.ImageFromPath(file, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c1, _ := img.ConfigName()
+	c2, err := loaded.ConfigName()
+	if err != nil || c1 != c2 {
+		t.Errorf("loaded config %s, %v; want %s", c2, err, c1)
+	}
+	m1, _ := img.Manifest()
+	m2, err := loaded.Manifest()
+	if err != nil || len(m2.Layers) != 2 || m2.Layers[0].Digest != m1.Layers[0].Digest || m2.Layers[1].Digest != m1.Layers[1].Digest {
+		t.Errorf("loaded layers %+v, %v; want %+v", m2, err, m1.Layers)
+	}
+	first, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		if err := WriteTarball(file, img, tags, anonymous); err != nil {
+			t.Fatal(err)
+		}
+		again, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(first, again) {
+			t.Fatal("rewriting the tarball changed its bytes")
+		}
 	}
 	if err := WriteTarball(file, img, []string{"example.com/app@sha256:abc"}, anonymous); err == nil {
 		t.Error("want error for a digest reference")
