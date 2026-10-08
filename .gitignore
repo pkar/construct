@@ -1,0 +1,6 @@
+/bin/
+/dist/
+/.slots/
+*.tar
+*.test
+.DS_Store
