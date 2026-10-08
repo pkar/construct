@@ -19,11 +19,16 @@ handling use `github.com/google/go-containerregistry`; build files use
   outputs (`output.go`; the docker tarball writer is our own so tag order
   stays deterministic), base locks (`lock.go`), engine loading (`load.go`),
   and the generated rootfs layer (`rootfs.go`).
+- `internal/run/`: run layers. `engine.go` drives the Apple `container`,
+  docker, and podman CLIs (run, exec, export, rm); `diff.go` turns two
+  filesystem exports into a layer with whiteouts; `runner.go` implements
+  `image.Runner` with the cache and lock pins. `runtest/` is a fake engine
+  played by the test binary (call `runtest.Serve()` in `TestMain`).
 - `internal/vcs/`: Git info for annotations and `{git.*}`/`{env.*}` stamping.
 - `internal/check/`: structure tests run against the flattened filesystem
   and config.
-- `examples/construct.yaml`: documented example; `TestExampleFile` keeps it
-  parsing. Keep it and README.md in step with the flags.
+- `examples/construct.yaml` and `examples/run.yaml`: documented examples;
+  `TestExampleFile` and `TestRunExampleFile` keep them parsing. Keep it and README.md in step with the flags.
 - `.github/workflows/`: `ci.yml` (Linux/macOS checks) and `release.yml`
   (tests, then `make dist` and `gh release create` on `v*` tags). Release
   targets live in `DIST_TARGETS` in the Makefile.
