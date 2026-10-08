@@ -142,29 +142,39 @@ func WriteLayout(dir string, a Artifact, refName string) error {
 // ReadLayout returns the single image or image index stored in the OCI
 // layout at dir.
 func ReadLayout(dir string) (Artifact, error) {
+	a, _, err := ReadLayoutRef(dir)
+	return a, err
+}
+
+// ReadLayoutRef is ReadLayout that also returns the image's ref.name
+// annotation, which is empty if the layout was written without a tag.
+func ReadLayoutRef(dir string) (Artifact, string, error) {
 	p, err := layout.FromPath(dir)
 	if err != nil {
-		return nil, fmt.Errorf("oci layout %s: %w", dir, err)
+		return nil, "", fmt.Errorf("oci layout %s: %w", dir, err)
 	}
 	idx, err := p.ImageIndex()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	im, err := idx.IndexManifest()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if len(im.Manifests) != 1 {
-		return nil, fmt.Errorf("oci layout %s: want exactly one image, found %d", dir, len(im.Manifests))
+		return nil, "", fmt.Errorf("oci layout %s: want exactly one image, found %d", dir, len(im.Manifests))
 	}
 	desc := im.Manifests[0]
+	ref := desc.Annotations[refNameAnnotation]
 	switch {
 	case desc.MediaType.IsIndex():
-		return idx.ImageIndex(desc.Digest)
+		a, err := idx.ImageIndex(desc.Digest)
+		return a, ref, err
 	case desc.MediaType.IsImage():
-		return idx.Image(desc.Digest)
+		a, err := idx.Image(desc.Digest)
+		return a, ref, err
 	default:
-		return nil, fmt.Errorf("oci layout %s: unsupported media type %s", dir, desc.MediaType)
+		return nil, "", fmt.Errorf("oci layout %s: unsupported media type %s", dir, desc.MediaType)
 	}
 }
 
@@ -191,21 +201,9 @@ func writeTarball(w io.Writer, a Artifact, tags []string, opts Options) error {
 	if !ok {
 		return fmt.Errorf("a tarball holds one platform; build with a single -platform")
 	}
-	if len(tags) == 0 {
-		return fmt.Errorf("a tarball needs a tag")
-	}
-	repoTags := make([]string, 0, len(tags))
-	for _, tag := range tags {
-		t, err := name.NewTag(tag, opts.nameOptions()...)
-		if err != nil {
-			return fmt.Errorf("tag %q: %w", tag, err)
-		}
-		// docker load wants the short form, with an explicit :latest.
-		s := t.String()
-		if t.TagStr() == name.DefaultTag && !strings.HasSuffix(s, ":"+name.DefaultTag) {
-			s += ":" + name.DefaultTag
-		}
-		repoTags = append(repoTags, s)
+	tagList, err := repoTags(tags, opts)
+	if err != nil {
+		return err
 	}
 
 	// This is the `docker save` format, written here rather than with
@@ -266,7 +264,7 @@ func writeTarball(w io.Writer, a Artifact, tags []string, opts Options) error {
 	}
 	manifest, err := json.Marshal([]tarball.Descriptor{{
 		Config:   cfgName.String(),
-		RepoTags: repoTags,
+		RepoTags: tagList,
 		Layers:   files,
 	}})
 	if err != nil {
@@ -276,6 +274,27 @@ func writeTarball(w io.Writer, a Artifact, tags []string, opts Options) error {
 		return err
 	}
 	return tw.Close()
+}
+
+// repoTags converts tags to the RepoTags form of a docker tarball.
+func repoTags(tags []string, opts Options) ([]string, error) {
+	if len(tags) == 0 {
+		return nil, fmt.Errorf("a tarball needs a tag")
+	}
+	out := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		t, err := name.NewTag(tag, opts.nameOptions()...)
+		if err != nil {
+			return nil, fmt.Errorf("tag %q: %w", tag, err)
+		}
+		// docker load wants the short form, with an explicit :latest.
+		s := t.String()
+		if t.TagStr() == name.DefaultTag && !strings.HasSuffix(s, ":"+name.DefaultTag) {
+			s += ":" + name.DefaultTag
+		}
+		out = append(out, s)
+	}
+	return out, nil
 }
 
 func writeTarEntry(tw *tar.Writer, name string, r io.Reader, size int64) error {

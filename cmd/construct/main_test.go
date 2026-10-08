@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -19,6 +20,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/registry"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
 
 	"github.com/pkar/construct/internal/image"
 )
@@ -472,6 +474,94 @@ func mustBuildScratch(t *testing.T) v1.Image {
 		t.Fatal(err)
 	}
 	return img
+}
+
+// fakeEngine puts a docker script on PATH that saves what `docker load`
+// receives to dir/in.tar, and returns dir.
+func fakeEngine(t *testing.T, name, script string) string {
+	t.Helper()
+	dir := t.TempDir()
+	body := "#!/bin/sh\n" + strings.ReplaceAll(script, "DIR", dir) + "\n"
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return dir
+}
+
+const saveLoad = `[ "$1" = load ] || exit 3; cat > DIR/in.tar; echo "Loaded image: fake"`
+
+func loadedTar(t *testing.T, dir string) (tags []string, arch string) {
+	t.Helper()
+	file := filepath.Join(dir, "in.tar")
+	m, err := tarball.LoadManifest(func() (io.ReadCloser, error) { return os.Open(file) })
+	if err != nil || len(m) != 1 {
+		t.Fatalf("loaded tar manifest %+v, %v", m, err)
+	}
+	img, err := tarball.ImageFromPath(file, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cf, err := img.ConfigFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m[0].RepoTags, cf.Architecture
+}
+
+func TestBuildLoad(t *testing.T) {
+	dir := fakeEngine(t, "podman", saveLoad)
+	layout := filepath.Join(t.TempDir(), "layout")
+	code, _, stderr := runCLI(t, "build", "-vcs=false", "-load", "-engine", "podman",
+		"-platform", "linux/amd64,linux/arm64,linux/riscv64", "-tag", "example.com/app:v1", "-tag", "app:dev", "-oci-layout", layout)
+	if code != 0 {
+		t.Fatalf("build -load exit %d: %s", code, stderr)
+	}
+	if !strings.Contains(stderr, "Loaded image: fake") || !strings.Contains(stderr, "into podman") {
+		t.Errorf("stderr = %q", stderr)
+	}
+	tags, arch := loadedTar(t, dir)
+	if !slices.Equal(tags, []string{"example.com/app:v1", "app:dev"}) || arch != runtime.GOARCH {
+		t.Errorf("loaded tags %q arch %s", tags, arch)
+	}
+
+	// construct load reads the layout and uses its ref.name by default.
+	os.Remove(filepath.Join(dir, "in.tar"))
+	code, out, stderr := runCLI(t, "load", "-engine", "podman", "-platform", "linux/riscv64", layout)
+	if code != 0 || !strings.HasPrefix(out, "sha256:") {
+		t.Fatalf("load exit %d out %q: %s", code, out, stderr)
+	}
+	if tags, arch := loadedTar(t, dir); !slices.Equal(tags, []string{"example.com/app:v1"}) || arch != "riscv64" {
+		t.Errorf("construct load: tags %q arch %s", tags, arch)
+	}
+	if code, _, stderr := runCLI(t, "load", "-engine", "podman", "-tag", "other:v2", "-platform", "linux/s390x", layout); code != 1 || !strings.Contains(stderr, "no linux/s390x image") {
+		t.Errorf("load missing platform: exit %d: %s", code, stderr)
+	}
+
+	for _, c := range []struct {
+		args []string
+		code int
+	}{
+		{[]string{"build", "-load"}, 2},
+		{[]string{"build", "-load", "-tag", "a:b", "-engine", "no-such-engine"}, 1},
+		{[]string{"build", "-oci-layout", t.TempDir(), "-engine", "podman"}, 2},
+		{[]string{"load"}, 2},
+		{[]string{"load", t.TempDir()}, 1},
+	} {
+		if code, _, stderr := runCLI(t, c.args...); code != c.code {
+			t.Errorf("%q: exit %d, want %d: %s", c.args, code, c.code, stderr)
+		}
+	}
+}
+
+func TestBuildLoadEngineFails(t *testing.T) {
+	// The engine exits without reading its input; the build must report
+	// the engine's message rather than hang.
+	fakeEngine(t, "docker", `echo "Cannot connect to the Docker daemon" >&2; exit 1`)
+	code, _, stderr := runCLI(t, "build", "-vcs=false", "-load", "-tag", "app:v1")
+	if code != 1 || !strings.Contains(stderr, "Cannot connect to the Docker daemon") {
+		t.Errorf("exit %d: %s", code, stderr)
+	}
 }
 
 func TestBuildLayoutThenPush(t *testing.T) {

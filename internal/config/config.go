@@ -32,6 +32,8 @@ type Image struct {
 	Push      *bool   `yaml:"push"`
 	OCILayout *string `yaml:"oci-layout"`
 	Tarball   *string `yaml:"tarball"`
+	Load      *bool   `yaml:"load"`
+	Engine    *string `yaml:"engine"`
 	Insecure  *bool   `yaml:"insecure"`
 	VCS       *bool   `yaml:"vcs"`
 
@@ -320,6 +322,8 @@ func Merge(base, over Image) Image {
 	set(&out.Push, over.Push)
 	set(&out.OCILayout, over.OCILayout)
 	set(&out.Tarball, over.Tarball)
+	set(&out.Load, over.Load)
+	set(&out.Engine, over.Engine)
 	set(&out.Insecure, over.Insecure)
 	set(&out.VCS, over.VCS)
 	set(&out.Compression, over.Compression)
