@@ -24,6 +24,7 @@ Usage:
   construct push [flags] DIR REF    push the image or index in an OCI layout to REF
   construct load [flags] DIR        load the image in an OCI layout into docker or podman
   construct lock [flags] [IMAGE...] pin base images to digests in construct.lock
+  construct test [flags] [IMAGE...] check files and config of built images
   construct version                 print the version
 
 Run 'construct COMMAND -h' for flags.
@@ -55,6 +56,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		err = runPush(ctx, args[1:], stdout, stderr)
 	case "load":
 		err = runLoad(ctx, args[1:], stdout, stderr)
+	case "test":
+		err = runTest(ctx, args[1:], stdout, stderr)
 	case "lock":
 		err = runLock(ctx, args[1:], stdout, stderr)
 	case "version", "-v", "--version":

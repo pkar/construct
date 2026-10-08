@@ -606,6 +606,98 @@ func TestBuildRootfs(t *testing.T) {
 	}
 }
 
+func TestStructureTests(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "app"), []byte("hello v2"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	doc := `
+vcs: false
+platforms: [linux/amd64, linux/arm64]
+oci-layout: out
+layers:
+  - contents: ["app:/app"]
+tests:
+  - {file: /app, mode: "0755", contains: v2}
+  - {absent: /bin/sh}
+  - config: {entrypoint: [/app]}
+entrypoint: [/app]
+`
+	file := filepath.Join(dir, "construct.yaml")
+	if err := os.WriteFile(file, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out, stderr := runCLI(t, "test", "-f", file)
+	if code != 0 || out != "ok\n" || !strings.Contains(stderr, "6 tests passed") {
+		t.Fatalf("test exit %d out %q: %s", code, out, stderr)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "out")); err == nil {
+		t.Error("construct test wrote the oci-layout output")
+	}
+
+	// Build runs the tests too; a failing test stops the outputs.
+	code, _, stderr = runCLI(t, "build", "-f", file, "-entrypoint", "/other")
+	if code != 1 || !strings.Contains(stderr, "FAIL linux/amd64: config: entrypoint") || !strings.Contains(stderr, "2 of 6 tests failed") {
+		t.Errorf("failing build exit %d: %s", code, stderr)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "out")); err == nil {
+		t.Error("failed tests still wrote the output")
+	}
+	if code, _, stderr := runCLI(t, "build", "-f", file, "-entrypoint", "/other", "-test=false"); code != 0 {
+		t.Errorf("-test=false exit %d: %s", code, stderr)
+	}
+	if code, _, stderr := runCLI(t, "build", "-f", file); code != 0 || !strings.Contains(stderr, "6 tests passed") {
+		t.Fatalf("build exit %d: %s", code, stderr)
+	}
+
+	// -checks runs a test file against an existing layout.
+	checks := filepath.Join(dir, "checks.yaml")
+	if err := os.WriteFile(checks, []byte("tests:\n  - {file: /app, contains: v3}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, _, stderr = runCLI(t, "test", "-checks", checks, filepath.Join(dir, "out"))
+	if code != 1 || strings.Count(stderr, "FAIL ") != 2 {
+		t.Errorf("-checks exit %d: %s", code, stderr)
+	}
+
+	for _, args := range [][]string{
+		{"test"},
+		{"test", "-f", file, "-checks", checks},
+		{"test", "-checks", checks},
+	} {
+		if code, _, _ := runCLI(t, args...); code != 2 {
+			t.Errorf("%q: exit %d, want 2", args, code)
+		}
+	}
+	if err := os.WriteFile(checks, []byte("tests:\n  - {file: relative}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, stderr := runCLI(t, "test", "-checks", checks, filepath.Join(dir, "out")); code != 1 || !strings.Contains(stderr, "absolute") {
+		t.Errorf("bad check file: exit %d: %s", code, stderr)
+	}
+}
+
+func TestStructureTestsRegistrySource(t *testing.T) {
+	t.Setenv("DOCKER_CONFIG", t.TempDir())
+	srv := httptest.NewServer(registry.New())
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	ref := u.Host + "/app:v1"
+	if code, _, stderr := runCLI(t, "build", "-vcs=false", "-platform", "linux/amd64", "-mkdir", "/data", "-push", "-tag", ref); code != 0 {
+		t.Fatalf("build exit %d: %s", code, stderr)
+	}
+	checks := filepath.Join(t.TempDir(), "checks.yaml")
+	if err := os.WriteFile(checks, []byte("tests:\n  - {file: /data, type: dir}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, out, stderr := runCLI(t, "test", "-checks", checks, ref); code != 0 || out != "ok\n" {
+		t.Errorf("test registry exit %d out %q: %s", code, out, stderr)
+	}
+	if code, _, _ := runCLI(t, "test", "-checks", checks, u.Host+"/missing:v1"); code != 1 {
+		t.Errorf("missing image: exit %d, want 1", code)
+	}
+}
+
 func TestBuildLayoutThenPush(t *testing.T) {
 	t.Setenv("DOCKER_CONFIG", t.TempDir())
 	t.Setenv("SOURCE_DATE_EPOCH", "1700000000")
