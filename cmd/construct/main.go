@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -92,11 +91,14 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		insecure   = fs.Bool("insecure", false, "allow plain HTTP and unverified TLS registries")
 		entrypoint optionalList
 		cmd        optionalList
-		adds       repeated
+		layers     layerFlags
 		env        repeated
 		labels     repeated
 	)
-	fs.Var(&adds, "add", "copy host `SRC:DST` into the image (repeatable); {os}, {arch}, {variant} in SRC expand per platform")
+	fs.Var(layerFlag{&layers}, "layer", "start a new layer `NAME`; later -add, -mkdir, and -symlink go into it")
+	fs.Var(itemFlag{&layers, image.ParseAdd}, "add", "copy host `SRC:DST[:OPTIONS]` into the image (repeatable); {os}, {arch}, {variant} in SRC\nexpand per platform. OPTIONS: mode=OCTAL,dirmode=OCTAL,owner=UID[:GID]")
+	fs.Var(itemFlag{&layers, image.ParseMkdir}, "mkdir", "create directory `DST[:OPTIONS]` (repeatable). OPTIONS: mode=OCTAL,owner=UID[:GID]")
+	fs.Var(itemFlag{&layers, image.ParseSymlink}, "symlink", "create symlink `DST:TARGET` (repeatable)")
 	fs.Var(&entrypoint, "entrypoint", `entrypoint as a JSON array or space-separated words`)
 	fs.Var(&cmd, "cmd", `default arguments as a JSON array or space-separated words`)
 	fs.Var(&env, "env", "set `KEY=VALUE` in the environment (repeatable)")
@@ -128,6 +130,7 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	spec := image.Spec{
 		Base:       *base,
 		Platform:   platforms[0],
+		Layers:     layers.layers,
 		Entrypoint: entrypoint.list,
 		Cmd:        cmd.list,
 		Env:        env,
@@ -136,13 +139,6 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 	if spec.Created, err = buildTime(); err != nil {
 		return err
-	}
-	for _, a := range adds {
-		add, err := image.ParseAdd(a)
-		if err != nil {
-			return err
-		}
-		spec.Adds = append(spec.Adds, add)
 	}
 	if len(labels) > 0 {
 		spec.Labels = map[string]string{}
@@ -251,39 +247,4 @@ func buildTime() (time.Time, error) {
 		return time.Time{}, fmt.Errorf("SOURCE_DATE_EPOCH %q: %w", s, err)
 	}
 	return time.Unix(sec, 0).UTC(), nil
-}
-
-// repeated collects every value of a repeatable flag.
-type repeated []string
-
-func (r *repeated) String() string     { return strings.Join(*r, ",") }
-func (r *repeated) Set(v string) error { *r = append(*r, v); return nil }
-
-// optionalList is a command line given either as a JSON array or as
-// space-separated words. It stays nil when the flag is not set, so the base
-// image value is inherited; -entrypoint '[]' clears it.
-type optionalList struct{ list []string }
-
-func (o *optionalList) String() string {
-	if o == nil || o.list == nil {
-		return ""
-	}
-	b, _ := json.Marshal(o.list)
-	return string(b)
-}
-
-func (o *optionalList) Set(v string) error {
-	if strings.HasPrefix(strings.TrimSpace(v), "[") {
-		var list []string
-		if err := json.Unmarshal([]byte(v), &list); err != nil {
-			return fmt.Errorf("want a JSON array of strings: %w", err)
-		}
-		if list == nil {
-			list = []string{}
-		}
-		o.list = list
-		return nil
-	}
-	o.list = strings.Fields(v)
-	return nil
 }

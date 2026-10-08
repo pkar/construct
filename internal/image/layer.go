@@ -1,10 +1,9 @@
-// Package image builds OCI images from a base image plus local files and
-// writes them to a registry, an OCI layout directory, or a tarball.
 package image
 
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"io/fs"
@@ -20,46 +19,36 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
 
-// Add copies Src on the host to Dst inside the image.
-//
-// A directory Src is copied recursively so that its contents land under Dst.
-// A file Src is written to Dst, or to Dst/<basename> when Dst ends in "/".
-type Add struct {
-	Src string
-	Dst string
-}
-
-// ParseAdd parses a SRC:DST flag value. DST must be an absolute path.
-func ParseAdd(s string) (Add, error) {
-	src, dst, ok := strings.Cut(s, ":")
-	if !ok || src == "" || dst == "" {
-		return Add{}, fmt.Errorf("add %q: want SRC:DST", s)
-	}
-	if !path.IsAbs(dst) {
-		return Add{}, fmt.Errorf("add %q: destination must be an absolute path", s)
-	}
-	return Add{Src: src, Dst: dst}, nil
+// LayerOptions controls how a layer is packed.
+type LayerOptions struct {
+	// Created stamps every entry's modification time.
+	Created time.Time
+	// MediaType is types.OCILayer or types.DockerLayer.
+	MediaType types.MediaType
 }
 
 type entry struct {
-	name string // image path without the leading slash
-	typ  byte
-	mode int64
-	src  string // host file for regular files
-	link string // symlink target
-	size int64
+	name     string // image path without the leading slash
+	typ      byte
+	mode     int64
+	uid, gid int
+	src      string // host file, for regular files read from disk
+	data     []byte // contents, for inline regular files
+	inline   bool
+	link     string // symlink target
+	size     int64
 }
 
-// Layer packs adds into a single deterministic layer. Entries are sorted,
-// owned by root, and stamped with mtime, so identical inputs give identical
-// digests. mediaType must be types.OCILayer or types.DockerLayer.
+// Layer packs items into one deterministic layer. Entries are sorted and
+// stamped with o.Created, so identical inputs give identical digests.
+// Later items replace earlier ones at the same path.
 //
-// The file list is fixed when Layer is called, but file contents are
+// The file list is fixed when Layer is called, but host file contents are
 // streamed from disk each time the layer is read (to hash, compress, and
 // upload it), so a layer never has to fit in memory. Sources must not change
 // until the image has been written.
-func Layer(adds []Add, mtime time.Time, mediaType types.MediaType) (v1.Layer, error) {
-	entries, err := collectEntries(adds)
+func Layer(items []Item, o LayerOptions) (v1.Layer, error) {
+	entries, err := collectEntries(items)
 	if err != nil {
 		return nil, err
 	}
@@ -68,18 +57,25 @@ func Layer(adds []Add, mtime time.Time, mediaType types.MediaType) (v1.Layer, er
 		go func() {
 			// If the reader stops early, writes fail with io.ErrClosedPipe
 			// and this goroutine exits.
-			pw.CloseWithError(writeTar(pw, entries, mtime))
+			pw.CloseWithError(writeTar(pw, entries, o.Created))
 		}()
 		return pr, nil
 	}
-	return tarball.LayerFromOpener(opener, tarball.WithMediaType(mediaType))
+	mt := o.MediaType
+	if mt == "" {
+		mt = types.OCILayer
+	}
+	return tarball.LayerFromOpener(opener, tarball.WithMediaType(mt))
 }
 
-// collectEntries resolves adds into the sorted list of layer entries.
-func collectEntries(adds []Add) ([]entry, error) {
+// collectEntries resolves items into the sorted list of layer entries.
+func collectEntries(items []Item) ([]entry, error) {
 	byName := map[string]entry{}
-	for _, a := range adds {
-		if err := collect(byName, a); err != nil {
+	for _, it := range items {
+		if err := it.Validate(); err != nil {
+			return nil, err
+		}
+		if err := collect(byName, it); err != nil {
 			return nil, err
 		}
 	}
@@ -104,6 +100,8 @@ func writeTar(w io.Writer, entries []entry, mtime time.Time) error {
 			Typeflag: e.typ,
 			Name:     e.name,
 			Mode:     e.mode,
+			Uid:      e.uid,
+			Gid:      e.gid,
 			ModTime:  mtime,
 			Format:   tar.FormatPAX,
 		}
@@ -118,10 +116,17 @@ func writeTar(w io.Writer, entries []entry, mtime time.Time) error {
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}
-		if e.typ == tar.TypeReg {
-			if err := copyFile(tw, e.src, e.size); err != nil {
-				return err
-			}
+		if e.typ != tar.TypeReg {
+			continue
+		}
+		var err error
+		if e.inline {
+			_, err = io.Copy(tw, bytes.NewReader(e.data))
+		} else {
+			err = copyFile(tw, e.src, e.size)
+		}
+		if err != nil {
+			return err
 		}
 	}
 	if err := tw.Close(); err != nil {
@@ -146,26 +151,40 @@ func copyFile(w io.Writer, name string, size int64) error {
 	return nil
 }
 
-// collect records the entries for one Add. Later adds replace earlier ones
-// at the same path.
-func collect(entries map[string]entry, a Add) error {
-	info, err := os.Lstat(a.Src)
+// collect records the entries for one item.
+func collect(byName map[string]entry, it Item) error {
+	dst := path.Clean(it.Dst)
+	switch it.Kind {
+	case Dir:
+		return put(byName, entry{name: dst, typ: tar.TypeDir, mode: modeOr(it.Mode, 0o755)}, it.Owner)
+	case Symlink:
+		return put(byName, entry{name: dst, typ: tar.TypeSymlink, mode: 0o777, link: it.Target}, it.Owner)
+	case File:
+		return put(byName, entry{
+			name: dst, typ: tar.TypeReg, mode: modeOr(it.Mode, 0o644),
+			data: it.Content, inline: true, size: int64(len(it.Content)),
+		}, it.Owner)
+	}
+
+	info, err := os.Lstat(it.Src)
 	if err != nil {
 		return err
 	}
-	dst := path.Clean(a.Dst)
 	if !info.IsDir() {
-		if strings.HasSuffix(a.Dst, "/") {
-			dst = path.Join(dst, filepath.Base(a.Src))
+		if strings.HasSuffix(it.Dst, "/") {
+			dst = path.Join(dst, filepath.Base(it.Src))
 		}
-		return put(entries, dst, a.Src, info)
-	}
-
-	return filepath.WalkDir(a.Src, func(p string, d fs.DirEntry, err error) error {
+		e, err := hostEntry(dst, it.Src, info, it)
 		if err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(a.Src, p)
+		return put(byName, e, it.Owner)
+	}
+	return filepath.WalkDir(it.Src, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(it.Src, p)
 		if err != nil {
 			return err
 		}
@@ -173,43 +192,73 @@ func collect(entries map[string]entry, a Add) error {
 		if err != nil {
 			return err
 		}
-		return put(entries, path.Join(dst, filepath.ToSlash(rel)), p, info)
+		e, err := hostEntry(path.Join(dst, filepath.ToSlash(rel)), p, info, it)
+		if err != nil {
+			return err
+		}
+		return put(byName, e, it.Owner)
 	})
 }
 
-func put(entries map[string]entry, dst, src string, info fs.FileInfo) error {
-	name := strings.TrimPrefix(dst, "/")
-	if name == "" {
-		// The image root itself; it always exists.
-		return nil
-	}
-	e := entry{name: name, mode: int64(info.Mode().Perm())}
+// hostEntry describes the host file src, stored at dst.
+func hostEntry(dst, src string, info fs.FileInfo, it Item) (entry, error) {
+	e := entry{name: dst, mode: tarMode(info.Mode())}
 	switch {
 	case info.Mode().IsRegular():
 		e.typ = tar.TypeReg
 		e.src = src
 		e.size = info.Size()
+		e.mode = modeOr(it.Mode, e.mode)
 	case info.IsDir():
 		e.typ = tar.TypeDir
+		e.mode = modeOr(it.DirMode, e.mode)
 	case info.Mode()&fs.ModeSymlink != 0:
 		target, err := os.Readlink(src)
 		if err != nil {
-			return err
+			return entry{}, err
 		}
 		e.typ = tar.TypeSymlink
 		e.link = target
+		// Link permissions differ between Linux and macOS and are ignored
+		// by runtimes, so fix them for reproducible digests.
+		e.mode = 0o777
 	default:
-		return fmt.Errorf("%s: unsupported file type %s", src, info.Mode().Type())
+		return entry{}, fmt.Errorf("%s: unsupported file type %s", src, info.Mode().Type())
 	}
-	entries[name] = e
+	return e, nil
+}
 
-	// Make sure every parent directory has its own entry, so runtimes that
-	// unpack the layer do not have to invent permissions for them.
-	for dir := path.Dir(name); dir != "."; dir = path.Dir(dir) {
-		if _, ok := entries[dir]; ok {
-			break
-		}
-		entries[dir] = entry{name: dir, typ: tar.TypeDir, mode: 0o755}
+func put(byName map[string]entry, e entry, owner *Owner) error {
+	e.name = strings.TrimPrefix(e.name, "/")
+	if e.name == "" {
+		// The image root itself; it always exists.
+		return nil
 	}
+	if owner != nil {
+		e.uid, e.gid = owner.UID, owner.GID
+	}
+	byName[e.name] = e
 	return nil
+}
+
+// tarMode converts a Go file mode to tar's chmod-style permission bits.
+func tarMode(m fs.FileMode) int64 {
+	mode := int64(m.Perm())
+	if m&fs.ModeSetuid != 0 {
+		mode |= 0o4000
+	}
+	if m&fs.ModeSetgid != 0 {
+		mode |= 0o2000
+	}
+	if m&fs.ModeSticky != 0 {
+		mode |= 0o1000
+	}
+	return mode
+}
+
+func modeOr(m *int64, def int64) int64 {
+	if m != nil {
+		return *m
+	}
+	return def
 }
