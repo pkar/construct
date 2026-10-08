@@ -233,6 +233,41 @@ func TestBuildConfigExtras(t *testing.T) {
 	}
 }
 
+func TestBuildZstdPush(t *testing.T) {
+	ctx := context.Background()
+	host := testRegistry(t)
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "app"), "binary", 0o755)
+	img, err := Build(ctx, Spec{
+		Base:        Scratch,
+		Platform:    v1.Platform{OS: "linux", Architecture: "amd64"},
+		Layers:      copies(filepath.Join(src, "app"), "/app"),
+		Compression: "zstd",
+	}, anonymous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := Push(ctx, img, host+"/zstd:v1", anonymous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := remote.Image(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := got.Manifest()
+	if err != nil || len(m.Layers) != 1 || m.Layers[0].MediaType != types.OCILayerZStd {
+		t.Fatalf("manifest = %+v, %v", m, err)
+	}
+	layers, err := got.Layers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := fileInLayer(t, layers[0], "app"); body != "binary" {
+		t.Errorf("app = %q", body)
+	}
+}
+
 func TestBuildRejectsBadEnv(t *testing.T) {
 	_, err := Build(context.Background(), Spec{Base: Scratch, Env: []string{"NOEQUALS"}}, anonymous)
 	if err == nil {

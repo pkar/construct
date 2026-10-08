@@ -269,6 +269,60 @@ func TestExpandItems(t *testing.T) {
 	}
 }
 
+func TestLayerCompression(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "data")
+	writeFile(t, src, string(bytes.Repeat([]byte("construct "), 10000)), 0o644)
+	items := []Item{{Kind: Copy, Src: src, Dst: "/data"}}
+	size := func(o LayerOptions) (int64, types.MediaType, v1.Hash) {
+		t.Helper()
+		o.Created = time.Unix(42, 0)
+		l, err := Layer(items, o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, err := l.Size()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mt, _ := l.MediaType()
+		diff, _ := l.DiffID()
+		// Every variant must still decompress to the same tar.
+		rc, err := l.Uncompressed()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rc.Close()
+		if e := readTar(t, rc); len(e) != 1 || len(e[0].body) != 100000 {
+			t.Fatalf("%+v: bad layer contents", o)
+		}
+		return n, mt, diff
+	}
+	gz, gzType, gzDiff := size(LayerOptions{})
+	gz9, _, _ := size(LayerOptions{Compression: "gzip", CompressionLevel: 9})
+	zs, zsType, zsDiff := size(LayerOptions{Compression: "zstd", CompressionLevel: 19})
+	if gzType != types.OCILayer || zsType != types.OCILayerZStd {
+		t.Errorf("media types %s, %s", gzType, zsType)
+	}
+	if gzDiff != zsDiff {
+		t.Errorf("diff IDs differ: %s vs %s", gzDiff, zsDiff)
+	}
+	if gz9 > gz || zs >= gz {
+		t.Errorf("sizes gzip %d, gzip-9 %d, zstd-19 %d", gz, gz9, zs)
+	}
+
+	for _, bad := range []LayerOptions{
+		{Compression: "lz4"},
+		{Compression: "gzip", CompressionLevel: 10},
+		{Compression: "zstd", CompressionLevel: 23},
+		{CompressionLevel: -1},
+		{Compression: "zstd", MediaType: types.DockerLayer},
+	} {
+		if _, err := Layer(items, bad); err == nil {
+			t.Errorf("Layer(%+v) succeeded", bad)
+		}
+	}
+}
+
 func TestLayerRejectsBadItems(t *testing.T) {
 	for _, it := range []Item{
 		{Kind: Copy, Src: filepath.Join(t.TempDir(), "nope"), Dst: "/x"},

@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	"cmp"
 	"fmt"
 	"io"
 	"io/fs"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/compression"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/google/go-containerregistry/pkg/v1/types"
@@ -23,8 +25,51 @@ import (
 type LayerOptions struct {
 	// Created stamps every entry's modification time.
 	Created time.Time
-	// MediaType is types.OCILayer or types.DockerLayer.
+	// MediaType is types.OCILayer or types.DockerLayer. It is set to
+	// types.OCILayerZStd for zstd compression.
 	MediaType types.MediaType
+	// Compression is "gzip" (the default) or "zstd". zstd layers are
+	// smaller and faster to unpack, but need an OCI manifest and a runtime
+	// from 2021 or later (containerd 1.5, Docker 23, Podman 3).
+	Compression string
+	// CompressionLevel is 1-9 for gzip and 1-22 for zstd; 0 uses the
+	// library default, which favours speed.
+	CompressionLevel int
+}
+
+// CheckCompression validates a compression name and level.
+func CheckCompression(name string, level int) error {
+	max := 9
+	switch name {
+	case "", "gzip":
+	case "zstd":
+		max = 22
+	default:
+		return fmt.Errorf("compression %q: want gzip or zstd", name)
+	}
+	if level < 0 || level > max {
+		return fmt.Errorf("compression level %d: want 1-%d for %s, or 0 for the default", level, max, cmp.Or(name, "gzip"))
+	}
+	return nil
+}
+
+func (o LayerOptions) tarballOptions() ([]tarball.LayerOption, error) {
+	if err := CheckCompression(o.Compression, o.CompressionLevel); err != nil {
+		return nil, err
+	}
+	mt := cmp.Or(o.MediaType, types.OCILayer)
+	c := compression.GZip
+	if o.Compression == "zstd" {
+		if mt == types.DockerLayer {
+			return nil, fmt.Errorf("zstd layers need an OCI image; the base uses Docker manifests")
+		}
+		mt, c = types.OCILayerZStd, compression.ZStd
+	}
+	opts := []tarball.LayerOption{tarball.WithMediaType(mt), tarball.WithCompression(c)}
+	if o.CompressionLevel != 0 {
+		opts = append(opts, tarball.WithCompressionLevel(o.CompressionLevel))
+	}
+	return opts, nil
 }
 
 type entry struct {
@@ -48,6 +93,10 @@ type entry struct {
 // upload it), so a layer never has to fit in memory. Sources must not change
 // until the image has been written.
 func Layer(items []Item, o LayerOptions) (v1.Layer, error) {
+	topts, err := o.tarballOptions()
+	if err != nil {
+		return nil, err
+	}
 	entries, err := collectEntries(items)
 	if err != nil {
 		return nil, err
@@ -61,11 +110,7 @@ func Layer(items []Item, o LayerOptions) (v1.Layer, error) {
 		}()
 		return pr, nil
 	}
-	mt := o.MediaType
-	if mt == "" {
-		mt = types.OCILayer
-	}
-	return tarball.LayerFromOpener(opener, tarball.WithMediaType(mt))
+	return tarball.LayerFromOpener(opener, topts...)
 }
 
 // collectEntries resolves items into the sorted list of layer entries.

@@ -54,6 +54,11 @@ type Spec struct {
 
 	// Created stamps the image config, history, and file times.
 	Created time.Time
+
+	// Compression and CompressionLevel apply to the new layers; see
+	// LayerOptions.
+	Compression      string
+	CompressionLevel int
 }
 
 // Options holds registry settings shared by pulls and pushes.
@@ -89,7 +94,12 @@ func Build(ctx context.Context, spec Spec, opts Options) (v1.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	lo := LayerOptions{Created: spec.Created, MediaType: types.OCILayer}
+	lo := LayerOptions{
+		Created:          spec.Created,
+		MediaType:        types.OCILayer,
+		Compression:      spec.Compression,
+		CompressionLevel: spec.CompressionLevel,
+	}
 	if mt == types.DockerManifestSchema2 {
 		lo.MediaType = types.DockerLayer
 	}
@@ -110,9 +120,13 @@ func Build(ctx context.Context, spec Spec, opts Options) (v1.Image, error) {
 		for i, it := range items {
 			descs[i] = it.describe()
 		}
+		lmt, err := layer.MediaType()
+		if err != nil {
+			return nil, err
+		}
 		img, err = mutate.Append(img, mutate.Addendum{
 			Layer:     layer,
-			MediaType: lo.MediaType,
+			MediaType: lmt,
 			History: v1.History{
 				Created:   v1.Time{Time: spec.Created},
 				CreatedBy: "construct: layer " + name + ": " + strings.Join(descs, "; "),

@@ -50,6 +50,8 @@ func TestUsageErrors(t *testing.T) {
 		{"bad add option", []string{"build", "-oci-layout", t.TempDir(), "-add", "app:/app:mode=999"}, 2},
 		{"duplicate layer", []string{"build", "-oci-layout", t.TempDir(), "-layer", "a", "-layer", "a"}, 2},
 		{"empty layer", []string{"build", "-oci-layout", t.TempDir(), "-layer", "a"}, 1},
+		{"bad compression", []string{"build", "-oci-layout", t.TempDir(), "-compression", "lz4"}, 2},
+		{"bad level", []string{"build", "-oci-layout", t.TempDir(), "-compression-level", "10"}, 2},
 		{"missing source", []string{"build", "-oci-layout", t.TempDir(), "-add", "/does/not/exist:/x"}, 1},
 		{"bad platform", []string{"build", "-oci-layout", t.TempDir(), "-platform", "a/b/c/d"}, 1},
 		{"multi-platform tarball", []string{"build", "-tag", "app:v1", "-tarball", "x.tar", "-platform", "linux/amd64,linux/arm64"}, 2},
