@@ -1,8 +1,11 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -13,7 +16,10 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+
+	"github.com/pkar/construct/internal/image"
 )
 
 func runCLI(t *testing.T, args ...string) (code int, stdout, stderr string) {
@@ -39,7 +45,11 @@ func TestUsageErrors(t *testing.T) {
 		{"stray arg", []string{"build", "-oci-layout", "x", "extra"}, 2},
 		{"bad flag", []string{"build", "-nope"}, 2},
 		{"push args", []string{"push", "only-one"}, 2},
-		{"bad add", []string{"build", "-oci-layout", t.TempDir(), "-add", "app:relative"}, 1},
+		{"bad add", []string{"build", "-oci-layout", t.TempDir(), "-add", "app:relative"}, 2},
+		{"bad add option", []string{"build", "-oci-layout", t.TempDir(), "-add", "app:/app:mode=999"}, 2},
+		{"duplicate layer", []string{"build", "-oci-layout", t.TempDir(), "-layer", "a", "-layer", "a"}, 2},
+		{"empty layer", []string{"build", "-oci-layout", t.TempDir(), "-layer", "a"}, 1},
+		{"missing source", []string{"build", "-oci-layout", t.TempDir(), "-add", "/does/not/exist:/x"}, 1},
 		{"bad platform", []string{"build", "-oci-layout", t.TempDir(), "-platform", "a/b/c/d"}, 1},
 		{"multi-platform tarball", []string{"build", "-tag", "app:v1", "-tarball", "x.tar", "-platform", "linux/amd64,linux/arm64"}, 2},
 		{"help", []string{"build", "-h"}, 0},
@@ -76,6 +86,59 @@ func TestOptionalList(t *testing.T) {
 	var o optionalList
 	if err := o.Set(`["unterminated`); err == nil {
 		t.Error("want error for bad JSON")
+	}
+}
+
+func TestBuildLayers(t *testing.T) {
+	src := t.TempDir()
+	for _, n := range []string{"dep.so", "app"} {
+		if err := os.WriteFile(filepath.Join(src, n), []byte(n), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dir := filepath.Join(t.TempDir(), "layout")
+	code, _, stderr := runCLI(t, "build",
+		"-layer", "deps", "-add", filepath.Join(src, "dep.so")+":/usr/lib/",
+		"-layer", "app", "-add", filepath.Join(src, "app")+":/app:mode=0555,owner=65532",
+		"-mkdir", "/data:mode=0700,owner=65532:65532",
+		"-symlink", "/usr/local/bin/app:/app",
+		"-oci-layout", dir,
+	)
+	if code != 0 {
+		t.Fatalf("build exit %d: %s", code, stderr)
+	}
+	a, err := image.ReadLayout(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layers, err := a.(v1.Image).Layers()
+	if err != nil || len(layers) != 2 {
+		t.Fatalf("layers = %d, %v; want 2", len(layers), err)
+	}
+	rc, err := layers[1].Uncompressed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	var got []string
+	tr := tar.NewReader(rc)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, fmt.Sprintf("%s %o %d:%d %s", hdr.Name, hdr.Mode, hdr.Uid, hdr.Gid, hdr.Linkname))
+	}
+	want := []string{
+		"app 555 65532:65532 ",
+		"data/ 700 65532:65532 ",
+		"usr/local/bin/app 777 0:0 /app",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("app layer:\n got %q\nwant %q", got, want)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,7 +40,7 @@ func TestBuildScratch(t *testing.T) {
 	spec := Spec{
 		Base:       Scratch,
 		Platform:   v1.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"},
-		Adds:       []Add{{Src: filepath.Join(src, "app"), Dst: "/app"}},
+		Layers:     copies(filepath.Join(src, "app"), "/app"),
 		Entrypoint: []string{"/app"},
 		Cmd:        []string{"--port", "8080"},
 		Env:        []string{"A=1", "B=2", "A=3"},
@@ -104,6 +105,69 @@ func TestBuildScratch(t *testing.T) {
 	}
 }
 
+func TestBuildLayers(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "lib", "dep.so"), "dependency", 0o644)
+	writeFile(t, filepath.Join(src, "app"), "v1", 0o755)
+	spec := Spec{
+		Base:     Scratch,
+		Platform: v1.Platform{OS: "linux", Architecture: "amd64"},
+		Layers: []LayerSpec{
+			{Name: "deps", Items: []Item{{Kind: Copy, Src: filepath.Join(src, "lib"), Dst: "/usr/lib/app"}}},
+			{Name: "app", Items: []Item{
+				{Kind: Copy, Src: filepath.Join(src, "app"), Dst: "/usr/local/bin/app"},
+				{Kind: Dir, Dst: "/data", Owner: &Owner{65532, 65532}},
+			}},
+		},
+	}
+	build := func() []v1.Hash {
+		t.Helper()
+		img, err := Build(context.Background(), spec, anonymous)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cf, err := img.ConfigFile()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{
+			"construct: layer deps: add /usr/lib/app",
+			"construct: layer app: add /usr/local/bin/app; mkdir /data",
+		}
+		var got []string
+		for _, h := range cf.History {
+			got = append(got, h.CreatedBy)
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("history = %q, want %q", got, want)
+		}
+		m, err := img.Manifest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var digests []v1.Hash
+		for _, l := range m.Layers {
+			digests = append(digests, l.Digest)
+		}
+		return digests
+	}
+	before := build()
+	if len(before) != 2 {
+		t.Fatalf("layers = %d, want 2", len(before))
+	}
+	// Changing the app leaves the dependency layer, and its upload, alone.
+	writeFile(t, filepath.Join(src, "app"), "v2", 0o755)
+	after := build()
+	if before[0] != after[0] || before[1] == after[1] {
+		t.Errorf("layer digests before %v after %v; want only the app layer to change", before, after)
+	}
+
+	spec.Layers = append(spec.Layers, LayerSpec{Name: "empty"})
+	if _, err := Build(context.Background(), spec, anonymous); err == nil || !strings.Contains(err.Error(), "layer empty is empty") {
+		t.Errorf("empty layer: err = %v", err)
+	}
+}
+
 func TestBuildRejectsBadEnv(t *testing.T) {
 	_, err := Build(context.Background(), Spec{Base: Scratch, Env: []string{"NOEQUALS"}}, anonymous)
 	if err == nil {
@@ -123,7 +187,7 @@ func TestBuildFromRegistryBaseAndPush(t *testing.T) {
 	base, err := Build(ctx, Spec{
 		Base:       Scratch,
 		Platform:   plat,
-		Adds:       []Add{{Src: filepath.Join(src, "one"), Dst: "/one"}},
+		Layers:     copies(filepath.Join(src, "one"), "/one"),
 		Entrypoint: []string{"/bin/base"},
 		Cmd:        []string{"serve"},
 		Env:        []string{"PATH=/bin", "KEEP=yes"},
@@ -140,7 +204,7 @@ func TestBuildFromRegistryBaseAndPush(t *testing.T) {
 	img, err := Build(ctx, Spec{
 		Base:     baseRef,
 		Platform: plat,
-		Adds:     []Add{{Src: filepath.Join(src, "two"), Dst: "/two"}},
+		Layers:   copies(filepath.Join(src, "two"), "/two"),
 		Env:      []string{"PATH=/usr/bin:/bin"},
 	}, anonymous)
 	if err != nil {
@@ -251,8 +315,8 @@ func TestBuildIndex(t *testing.T) {
 
 	// A multi-platform base, then an app index built on top of it.
 	base, err := BuildIndex(ctx, Spec{
-		Base: Scratch,
-		Adds: []Add{{Src: filepath.Join(src, "base-{os}-{arch}"), Dst: "/base"}},
+		Base:   Scratch,
+		Layers: copies(filepath.Join(src, "base-{os}-{arch}"), "/base"),
 	}, platforms, anonymous)
 	if err != nil {
 		t.Fatal(err)
@@ -263,7 +327,7 @@ func TestBuildIndex(t *testing.T) {
 	}
 	idx, err := BuildIndex(ctx, Spec{
 		Base:       baseRef,
-		Adds:       []Add{{Src: filepath.Join(src, "app-{os}-{arch}"), Dst: "/app"}},
+		Layers:     copies(filepath.Join(src, "app-{os}-{arch}"), "/app"),
 		Entrypoint: []string{"/app"},
 	}, platforms, anonymous)
 	if err != nil {

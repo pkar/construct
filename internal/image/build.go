@@ -25,10 +25,10 @@ type Spec struct {
 	// Platform selects the base image from a multi-platform index and is
 	// recorded in the config of scratch images.
 	Platform v1.Platform
-	// Adds become one new layer on top of the base. No layer is added when
-	// Adds is empty. {os}, {arch}, and {variant} in Src are replaced with
-	// the platform's values, so one spec can pick per-platform binaries.
-	Adds []Add
+	// Layers are added on top of the base in order. {os}, {arch}, and
+	// {variant} in a Copy item's Src are replaced with the platform's
+	// values, so one spec can pick per-platform binaries.
+	Layers []LayerSpec
 
 	// Nil Entrypoint or Cmd inherit the base value; an empty non-nil slice
 	// clears it.
@@ -74,26 +74,37 @@ func Build(ctx context.Context, spec Spec, opts Options) (v1.Image, error) {
 		return nil, err
 	}
 
-	if len(spec.Adds) > 0 {
-		adds := expandAdds(spec.Adds, spec.Platform)
-		mt, err := img.MediaType()
-		if err != nil {
-			return nil, err
+	mt, err := img.MediaType()
+	if err != nil {
+		return nil, err
+	}
+	lo := LayerOptions{Created: spec.Created, MediaType: types.OCILayer}
+	if mt == types.DockerManifestSchema2 {
+		lo.MediaType = types.DockerLayer
+	}
+	for i, ls := range spec.Layers {
+		name := ls.Name
+		if name == "" {
+			name = fmt.Sprintf("layer %d", i+1)
 		}
-		layerType := types.OCILayer
-		if mt == types.DockerManifestSchema2 {
-			layerType = types.DockerLayer
+		if len(ls.Items) == 0 {
+			return nil, fmt.Errorf("layer %s is empty", name)
 		}
-		layer, err := Layer(adds, spec.Created, layerType)
+		items := expandItems(ls.Items, spec.Platform)
+		layer, err := Layer(items, lo)
 		if err != nil {
-			return nil, fmt.Errorf("build layer: %w", err)
+			return nil, fmt.Errorf("layer %s: %w", name, err)
+		}
+		descs := make([]string, len(items))
+		for i, it := range items {
+			descs[i] = it.describe()
 		}
 		img, err = mutate.Append(img, mutate.Addendum{
 			Layer:     layer,
-			MediaType: layerType,
+			MediaType: lo.MediaType,
 			History: v1.History{
 				Created:   v1.Time{Time: spec.Created},
-				CreatedBy: "construct: add " + describeAdds(adds),
+				CreatedBy: "construct: layer " + name + ": " + strings.Join(descs, "; "),
 			},
 		})
 		if err != nil {
@@ -231,11 +242,14 @@ func ParsePlatforms(s string) ([]v1.Platform, error) {
 	return out, nil
 }
 
-func expandAdds(adds []Add, p v1.Platform) []Add {
+func expandItems(items []Item, p v1.Platform) []Item {
 	r := strings.NewReplacer("{os}", p.OS, "{arch}", p.Architecture, "{variant}", p.Variant)
-	out := make([]Add, len(adds))
-	for i, a := range adds {
-		out[i] = Add{Src: r.Replace(a.Src), Dst: a.Dst}
+	out := make([]Item, len(items))
+	for i, it := range items {
+		if it.Kind == Copy {
+			it.Src = r.Replace(it.Src)
+		}
+		out[i] = it
 	}
 	return out
 }
@@ -285,12 +299,4 @@ func setEnv(env []string, key, kv string) []string {
 		}
 	}
 	return append(env, kv)
-}
-
-func describeAdds(adds []Add) string {
-	parts := make([]string, len(adds))
-	for i, a := range adds {
-		parts[i] = a.Src + ":" + a.Dst
-	}
-	return strings.Join(parts, " ")
 }
