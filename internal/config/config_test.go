@@ -181,6 +181,27 @@ func TestMergeFlagsOverFile(t *testing.T) {
 	}
 }
 
+func TestParseRootfs(t *testing.T) {
+	doc := "rootfs: {skeleton: true, users: [\"a:1\"], ca-certs: certs/ca.pem, tzdata: system}\n" +
+		"images:\n  - name: x\n    rootfs: {users: [\"b:2\"]}\n"
+	f, err := Parse([]byte(doc), "/src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	images, err := f.Select(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := images[0].Rootfs.Image()
+	want := image.Rootfs{Skeleton: true, Users: []string{"a:1", "b:2"}, CACerts: filepath.Join("/src", "certs/ca.pem"), Tzdata: image.System}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("rootfs = %+v, want %+v", got, want)
+	}
+	if (*Rootfs)(nil).Image().Empty() != true {
+		t.Error("nil rootfs not empty")
+	}
+}
+
 func TestLoadResolvesAgainstFileDir(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "construct.yaml")

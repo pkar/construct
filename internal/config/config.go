@@ -40,6 +40,7 @@ type Image struct {
 	Compression      *string `yaml:"compression"`
 	CompressionLevel *int    `yaml:"compression-level"`
 
+	Rootfs *Rootfs `yaml:"rootfs"`
 	Layers []Layer `yaml:"layers"`
 
 	Entrypoint  *Command          `yaml:"entrypoint"`
@@ -52,6 +53,33 @@ type Image struct {
 	StopSignal  *string           `yaml:"stop-signal"`
 	User        *string           `yaml:"user"`
 	WorkDir     *string           `yaml:"workdir"`
+}
+
+// Rootfs asks construct to generate the files a minimal image needs; see
+// image.Rootfs. ca-certs and tzdata are host paths or "system".
+type Rootfs struct {
+	Skeleton *bool    `yaml:"skeleton"`
+	Users    []string `yaml:"users"`
+	CACerts  *string  `yaml:"ca-certs"`
+	Tzdata   *string  `yaml:"tzdata"`
+}
+
+// Image returns the rootfs as image.Rootfs; nil gives the zero value.
+func (r *Rootfs) Image() image.Rootfs {
+	if r == nil {
+		return image.Rootfs{}
+	}
+	out := image.Rootfs{Users: r.Users}
+	if r.Skeleton != nil {
+		out.Skeleton = *r.Skeleton
+	}
+	if r.CACerts != nil {
+		out.CACerts = *r.CACerts
+	}
+	if r.Tzdata != nil {
+		out.Tzdata = *r.Tzdata
+	}
+	return out
 }
 
 // Layer is a named group of items.
@@ -300,6 +328,13 @@ func (im *Image) resolve(dir string) {
 	}
 	abs(im.OCILayout)
 	abs(im.Tarball)
+	if im.Rootfs != nil {
+		for _, p := range []*string{im.Rootfs.CACerts, im.Rootfs.Tzdata} {
+			if p != nil && *p != image.System {
+				abs(p)
+			}
+		}
+	}
 	for i := range im.Layers {
 		for j := range im.Layers[i].Contents {
 			it := &im.Layers[i].Contents[j]
@@ -339,6 +374,7 @@ func Merge(base, over Image) Image {
 	if over.Tags != nil {
 		out.Tags = over.Tags
 	}
+	out.Rootfs = mergeRootfs(base.Rootfs, over.Rootfs)
 	out.Layers = concat(base.Layers, over.Layers)
 	out.Env = concat(base.Env, over.Env)
 	out.Expose = concat(base.Expose, over.Expose)
@@ -346,6 +382,21 @@ func Merge(base, over Image) Image {
 	out.Labels = mergeMap(base.Labels, over.Labels)
 	out.Annotations = mergeMap(base.Annotations, over.Annotations)
 	return out
+}
+
+func mergeRootfs(base, over *Rootfs) *Rootfs {
+	if base == nil {
+		return over
+	}
+	if over == nil {
+		return base
+	}
+	out := *base
+	set(&out.Skeleton, over.Skeleton)
+	set(&out.CACerts, over.CACerts)
+	set(&out.Tzdata, over.Tzdata)
+	out.Users = concat(base.Users, over.Users)
+	return &out
 }
 
 func set[T any](dst **T, v *T) {

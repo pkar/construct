@@ -54,6 +54,10 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		compress   = fs.String("compression", "", "layer `compression`: gzip (default), or zstd (smaller and faster; needs an OCI base\nand a recent runtime)")
 		level      = fs.Int("compression-level", 0, "compression `level`: 1-9 for gzip, 1-22 for zstd; 0 for the default")
 		useVCS     = fs.Bool("vcs", true, "annotate the image with the Git commit and source URL")
+		skeleton   = fs.Bool("skeleton", false, "add a minimal root filesystem: /etc, /home, /root, /tmp, /var, passwd and group\nwith root, nobody, and nonroot (65532)")
+		caCerts    = fs.String("ca-certs", "", "add CA certificates from PEM `file` at "+image.CACertsPath+"; system uses\nthe build machine's bundle")
+		tzdata     = fs.String("tzdata", "", "add time zone data from zoneinfo `directory` at "+image.ZoneinfoDir+"; system uses\nthe build machine's")
+		users      repeated
 		lockPath   = fs.String("lock", "", "pin base images to the digests in lock `file`, adding missing ones (default\nconstruct.lock next to -f, when it exists)")
 		locked     = fs.Bool("locked", false, "fail if a base image is missing from the lock file; never update it")
 		entrypoint optionalList
@@ -70,6 +74,7 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	fs.Var(itemFlag{&layers, image.ParseAdd}, "add", "copy host `SRC:DST[:OPTIONS]` into the image (repeatable); {os}, {arch}, {variant} in SRC\nexpand per platform. OPTIONS: mode=OCTAL,dirmode=OCTAL,owner=UID[:GID]")
 	fs.Var(itemFlag{&layers, image.ParseMkdir}, "mkdir", "create directory `DST[:OPTIONS]` (repeatable). OPTIONS: mode=OCTAL,owner=UID[:GID]")
 	fs.Var(itemFlag{&layers, image.ParseSymlink}, "symlink", "create symlink `DST:TARGET` (repeatable)")
+	fs.Var(&users, "add-user", "add user `NAME:UID[:GID[:HOME]]` to /etc/passwd and /etc/group, with a home directory\n(repeatable; scratch base only)")
 	fs.Var(&tags, "tag", "image `reference`, e.g. registry.example.com/team/app:v1 (repeatable); {git.commit}, {git.short},\n{git.branch}, {git.tag}, and {env.NAME} expand here and in label and annotation values")
 	fs.Var(&entrypoint, "entrypoint", `entrypoint as a JSON array or space-separated words`)
 	fs.Var(&cmd, "cmd", `default arguments as a JSON array or space-separated words`)
@@ -87,9 +92,23 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 
 	over := config.Image{Layers: layers.layers}
+	rootfs := func() *config.Rootfs {
+		if over.Rootfs == nil {
+			over.Rootfs = &config.Rootfs{}
+		}
+		return over.Rootfs
+	}
 	var err error
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
+		case "skeleton":
+			rootfs().Skeleton = skeleton
+		case "ca-certs":
+			rootfs().CACerts = caCerts
+		case "tzdata":
+			rootfs().Tzdata = tzdata
+		case "add-user":
+			rootfs().Users = users
 		case "base":
 			over.Base = base
 		case "platform":
@@ -329,6 +348,16 @@ func newPlan(im config.Image, dir string, stderr io.Writer) (*plan, error) {
 			return p, usageError{err}
 		}
 		p.spec.ExposedPorts = append(p.spec.ExposedPorts, norm)
+	}
+	if r := im.Rootfs.Image(); !r.Empty() {
+		if r.WritesUsers() && p.spec.Base != image.Scratch {
+			return p, usagef("-skeleton and -add-user write /etc/passwd, which would replace the base image's; use them with a scratch base")
+		}
+		ls, err := r.Layer()
+		if err != nil {
+			return p, err
+		}
+		p.spec.Layers = append(p.spec.Layers, ls)
 	}
 	for _, l := range im.Layers {
 		ls := image.LayerSpec{Name: l.Name}

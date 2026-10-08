@@ -564,6 +564,48 @@ func TestBuildLoadEngineFails(t *testing.T) {
 	}
 }
 
+func TestBuildRootfs(t *testing.T) {
+	src := t.TempDir()
+	ca := filepath.Join(src, "ca.pem")
+	if err := os.WriteFile(ca, []byte("PEM"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	layout := filepath.Join(t.TempDir(), "out")
+	code, _, stderr := runCLI(t, "build", "-vcs=false", "-platform", "linux/amd64", "-skeleton", "-add-user", "app:1000",
+		"-ca-certs", ca, "-user", "app", "-add", ca+":/app/ca.pem", "-oci-layout", layout)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	a, err := image.ReadLayout(layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layers, err := a.(v1.Image).Layers()
+	if err != nil || len(layers) != 2 {
+		t.Fatalf("layers = %d, %v; want rootfs + app", len(layers), err)
+	}
+	cf, _ := a.(v1.Image).ConfigFile()
+	if h := cf.History[0].CreatedBy; !strings.Contains(h, "layer rootfs") {
+		t.Errorf("first layer history %q", h)
+	}
+
+	// A base image's /etc/passwd must not be replaced.
+	for _, args := range [][]string{
+		{"build", "-base", "example.com/base:v1", "-skeleton", "-oci-layout", layout},
+		{"build", "-add-user", "Bad", "-oci-layout", layout},
+		{"build", "-tzdata", filepath.Join(src, "missing"), "-oci-layout", layout},
+	} {
+		code, _, stderr := runCLI(t, args...)
+		want := 1
+		if args[1] == "-base" {
+			want = 2
+		}
+		if code != want {
+			t.Errorf("%q: exit %d, want %d: %s", args, code, want, stderr)
+		}
+	}
+}
+
 func TestBuildLayoutThenPush(t *testing.T) {
 	t.Setenv("DOCKER_CONFIG", t.TempDir())
 	t.Setenv("SOURCE_DATE_EPOCH", "1700000000")
