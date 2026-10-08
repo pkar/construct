@@ -3,6 +3,8 @@ package image
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -26,27 +28,84 @@ type Artifact interface {
 // Push uploads a to the registry reference ref and returns the digest
 // reference that was written.
 func Push(ctx context.Context, a Artifact, ref string, opts Options) (name.Digest, error) {
-	r, err := name.ParseReference(ref, opts.nameOptions()...)
-	if err != nil {
-		return name.Digest{}, fmt.Errorf("reference %q: %w", ref, err)
-	}
-	ro := opts.remoteOptions(ctx)
-	switch a := a.(type) {
-	case v1.ImageIndex:
-		err = remote.WriteIndex(r, a, ro...)
-	case v1.Image:
-		err = remote.Write(r, a, ro...)
-	default:
-		return name.Digest{}, fmt.Errorf("push %s: unsupported artifact %T", r, a)
-	}
-	if err != nil {
-		return name.Digest{}, fmt.Errorf("push %s: %w", r, err)
-	}
-	d, err := a.Digest()
+	ds, err := PushAll(ctx, a, []string{ref}, opts)
 	if err != nil {
 		return name.Digest{}, err
 	}
-	return r.Context().Digest(d.String()), nil
+	return ds[0], nil
+}
+
+// PushAll uploads a under every reference in refs and returns one digest
+// reference per repository, in the order the repositories first appear.
+// Blobs and the manifest are written once per repository; further tags in
+// the same repository only point at the manifest that is already there.
+func PushAll(ctx context.Context, a Artifact, refs []string, opts Options) ([]name.Digest, error) {
+	if len(refs) == 0 {
+		return nil, fmt.Errorf("push: no references")
+	}
+	d, err := a.Digest()
+	if err != nil {
+		return nil, err
+	}
+	parsed, err := ParseRefs(refs, opts)
+	if err != nil {
+		return nil, err
+	}
+	ro := opts.remoteOptions(ctx)
+	var out []name.Digest
+	written := map[string]bool{}
+	for _, r := range parsed {
+		repo := r.Context().String()
+		if dr, ok := r.(name.Digest); ok && dr.DigestStr() != d.String() {
+			return out, fmt.Errorf("push %s: image digest is %s", r, d)
+		}
+		switch {
+		case !written[repo]:
+			err = write(r, a, ro)
+			written[repo] = true
+			out = append(out, r.Context().Digest(d.String()))
+		case isTag(r):
+			err = remote.Tag(r.(name.Tag), a.(remote.Taggable), ro...)
+		}
+		if err != nil {
+			return out, fmt.Errorf("push %s: %w", r, err)
+		}
+	}
+	return out, nil
+}
+
+func isTag(r name.Reference) bool {
+	_, ok := r.(name.Tag)
+	return ok
+}
+
+func write(r name.Reference, a Artifact, ro []remote.Option) error {
+	switch a := a.(type) {
+	case v1.ImageIndex:
+		return remote.WriteIndex(r, a, ro...)
+	case v1.Image:
+		return remote.Write(r, a, ro...)
+	default:
+		return fmt.Errorf("unsupported artifact %T", a)
+	}
+}
+
+// ParseRefs parses image references, rejecting duplicates.
+func ParseRefs(refs []string, opts Options) ([]name.Reference, error) {
+	seen := map[string]bool{}
+	out := make([]name.Reference, 0, len(refs))
+	for _, s := range refs {
+		r, err := name.ParseReference(s, opts.nameOptions()...)
+		if err != nil {
+			return nil, fmt.Errorf("reference %q: %w", s, err)
+		}
+		if seen[r.Name()] {
+			return nil, fmt.Errorf("reference %s given twice", r.Name())
+		}
+		seen[r.Name()] = true
+		out = append(out, r)
+	}
+	return out, nil
 }
 
 // WriteLayout writes a as the only entry in the OCI layout at dir,
@@ -105,18 +164,38 @@ func ReadLayout(dir string) (Artifact, error) {
 }
 
 // WriteTarball writes a single-platform image to file in the format
-// accepted by `docker load` and `podman load`, tagged as tag.
-func WriteTarball(file string, a Artifact, tag string, opts Options) error {
-	img, ok := a.(v1.Image)
-	if !ok {
-		return fmt.Errorf("tarball %s: holds one platform; build with a single -platform", file)
-	}
-	t, err := name.NewTag(tag, opts.nameOptions()...)
+// accepted by `docker load` and `podman load`, tagged with every tag.
+func WriteTarball(file string, a Artifact, tags []string, opts Options) error {
+	f, err := os.Create(file)
 	if err != nil {
-		return fmt.Errorf("tag %q: %w", tag, err)
+		return fmt.Errorf("tarball %s: %w", file, err)
 	}
-	if err := tarball.WriteToFile(file, t, img); err != nil {
+	if err := writeTarball(f, a, tags, opts); err != nil {
+		f.Close()
+		os.Remove(file)
+		return fmt.Errorf("tarball %s: %w", file, err)
+	}
+	if err := f.Close(); err != nil {
 		return fmt.Errorf("tarball %s: %w", file, err)
 	}
 	return nil
+}
+
+func writeTarball(w io.Writer, a Artifact, tags []string, opts Options) error {
+	img, ok := a.(v1.Image)
+	if !ok {
+		return fmt.Errorf("a tarball holds one platform; build with a single -platform")
+	}
+	if len(tags) == 0 {
+		return fmt.Errorf("a tarball needs a tag")
+	}
+	refs := map[name.Reference]v1.Image{}
+	for _, tag := range tags {
+		t, err := name.NewTag(tag, opts.nameOptions()...)
+		if err != nil {
+			return fmt.Errorf("tag %q: %w", tag, err)
+		}
+		refs[t] = img
+	}
+	return tarball.MultiRefWrite(refs, w)
 }

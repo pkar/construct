@@ -2,8 +2,10 @@ package image
 
 import (
 	"context"
+	"io"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/registry"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
 
@@ -451,7 +454,7 @@ func TestBuildIndex(t *testing.T) {
 		t.Errorf("layout digest %s, want %s", d, pushed.DigestStr())
 	}
 
-	if err := WriteTarball(filepath.Join(t.TempDir(), "x.tar"), idx, "app:multi", anonymous); err == nil {
+	if err := WriteTarball(filepath.Join(t.TempDir(), "x.tar"), idx, []string{"app:multi"}, anonymous); err == nil {
 		t.Error("want error writing an index as a tarball")
 	}
 }
@@ -497,10 +500,60 @@ func TestWriteTarball(t *testing.T) {
 		t.Fatal(err)
 	}
 	file := filepath.Join(t.TempDir(), "img.tar")
-	if err := WriteTarball(file, img, "example.com/app:v1", anonymous); err != nil {
+	tags := []string{"example.com/app:v1", "example.com/app:latest"}
+	if err := WriteTarball(file, img, tags, anonymous); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteTarball(file, img, "example.com/app@sha256:abc", anonymous); err == nil {
+	m, err := tarball.LoadManifest(func() (io.ReadCloser, error) { return os.Open(file) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m) != 1 || !slices.Equal(m[0].RepoTags, tags) {
+		t.Errorf("tarball manifest = %+v, want one image tagged %q", m, tags)
+	}
+	if err := WriteTarball(file, img, []string{"example.com/app@sha256:abc"}, anonymous); err == nil {
 		t.Error("want error for a digest reference")
+	}
+	if _, err := os.Stat(file); !os.IsNotExist(err) {
+		t.Errorf("failed write left %s behind: %v", file, err)
+	}
+}
+
+func TestPushAll(t *testing.T) {
+	ctx := context.Background()
+	host := testRegistry(t)
+	img, err := Build(ctx, Spec{Base: Scratch, Platform: v1.Platform{OS: "linux", Architecture: "amd64"}}, anonymous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, _ := img.Digest()
+	refs := []string{host + "/app:v1", host + "/app:latest", host + "/mirror/app:v1", host + "/app@" + d.String()}
+	got, err := PushAll(ctx, img, refs, anonymous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Context().RepositoryStr() != "app" || got[1].Context().RepositoryStr() != "mirror/app" {
+		t.Errorf("digests = %v, want one per repository", got)
+	}
+	for _, r := range refs[:3] {
+		ref, err := name.ParseReference(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		desc, err := remote.Head(ref)
+		if err != nil || desc.Digest != d {
+			t.Errorf("%s: %v, %v; want %s", r, desc, err, d)
+		}
+	}
+
+	for _, bad := range [][]string{
+		nil,
+		{host + "/app:v1", host + "/app:v1"},
+		{host + "/app@sha256:" + strings.Repeat("0", 64)},
+		{"UPPER/app:v1"},
+	} {
+		if _, err := PushAll(ctx, img, bad, anonymous); err == nil {
+			t.Errorf("PushAll(%q) succeeded", bad)
+		}
 	}
 }

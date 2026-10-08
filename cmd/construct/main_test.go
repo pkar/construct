@@ -216,6 +216,58 @@ func TestBuildConfigAndAnnotations(t *testing.T) {
 	}
 }
 
+func TestBuildStampedTags(t *testing.T) {
+	t.Setenv("DOCKER_CONFIG", t.TempDir())
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	t.Setenv("BUILD_NUMBER", "17")
+	srv := httptest.NewServer(registry.New())
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	repo := t.TempDir()
+	gitInit(t, repo, "https://example.com/org/app.git")
+	t.Chdir(repo)
+
+	code, out, stderr := runCLI(t, "build", "-push",
+		"-tag", u.Host+"/app:{git.short}",
+		"-tag", u.Host+"/app:build-{env.BUILD_NUMBER}",
+		"-tag", u.Host+"/app:{git.branch}",
+		"-label", "build={env.BUILD_NUMBER}",
+	)
+	if code != 0 {
+		t.Fatalf("build exit %d: %s", code, stderr)
+	}
+	lines := strings.Fields(out)
+	if len(lines) != 1 || !strings.Contains(lines[0], "/app@sha256:") {
+		t.Fatalf("stdout = %q, want one digest reference", out)
+	}
+	tags, err := remote.List(mustRepo(t, u.Host+"/app"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	short := slices.IndexFunc(tags, func(s string) bool { return len(s) == 12 })
+	if len(tags) != 3 || !slices.Contains(tags, "build-17") || !slices.Contains(tags, "main") || short < 0 {
+		t.Errorf("tags = %q", tags)
+	}
+	img, err := remote.Image(mustRepo(t, u.Host+"/app").Tag("main"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cf, err := img.ConfigFile()
+	if err != nil || cf.Config.Labels["build"] != "17" {
+		t.Errorf("labels = %v, %v", cf.Config.Labels, err)
+	}
+
+	for _, args := range [][]string{
+		{"build", "-push", "-tag", u.Host + "/app:{git.tag}"},
+		{"build", "-push", "-tag", u.Host + "/app:{env.NOT_SET_ANYWHERE}"},
+		{"build", "-push", "-tag", u.Host + "/app:x", "-tag", u.Host + "/app:x"},
+	} {
+		if code, _, stderr := runCLI(t, args...); code != 1 {
+			t.Errorf("%q: exit %d, want 1: %s", args, code, stderr)
+		}
+	}
+}
+
 func TestBuildLayoutThenPush(t *testing.T) {
 	t.Setenv("DOCKER_CONFIG", t.TempDir())
 	t.Setenv("SOURCE_DATE_EPOCH", "1700000000")
@@ -325,4 +377,13 @@ func TestBuildMultiPlatform(t *testing.T) {
 	if want := []string{"linux/amd64", "linux/arm64"}; !slices.Equal(got, want) {
 		t.Errorf("platforms = %q, want %q", got, want)
 	}
+}
+
+func mustRepo(t *testing.T, s string) name.Repository {
+	t.Helper()
+	r, err := name.NewRepository(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
 }
