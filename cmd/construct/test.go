@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -11,7 +10,6 @@ import (
 	"strings"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
-	"gopkg.in/yaml.v3"
 
 	"github.com/pkar/construct/internal/check"
 	"github.com/pkar/construct/internal/config"
@@ -20,13 +18,14 @@ import (
 
 const testUsage = `Usage:
   construct test -f construct.yaml [IMAGE...]
-  construct test -checks FILE [flags] SOURCE
+  construct test -checks FILE [-image NAME] [flags] SOURCE
 
 Run structure tests: checks on an image's files and config that need no
 container runtime. With -f, each selected image is built in memory and
 checked against its tests: (construct build also runs them before writing
-outputs). With -checks, the tests: list in FILE is run against SOURCE,
-an OCI layout directory or a registry reference. Every platform of a
+outputs). With -checks, the tests in FILE (a build file, or a file with
+just a tests: list) are run against SOURCE, an OCI layout directory or a
+registry reference. Every platform of a
 multi-platform image is checked.
 
 Flags:
@@ -37,7 +36,8 @@ func runTest(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	fs.SetOutput(stderr)
 	var (
 		file     = fs.String("f", "", "build images from build `file` and run their tests")
-		checks   = fs.String("checks", "", "run the tests: in `file` against SOURCE")
+		checks   = fs.String("checks", "", "run the tests: in `file` (a build file, or one holding only tests:) against SOURCE")
+		name     = fs.String("image", "", "with -checks, use the tests of image `NAME` in a file with several images")
 		insecure = fs.Bool("insecure", false, "allow plain HTTP and unverified TLS registries")
 	)
 	fs.Usage = func() {
@@ -53,7 +53,9 @@ func runTest(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	case *checks != "" && fs.NArg() != 1:
 		return usageErr(fs, "-checks needs one SOURCE: an OCI layout directory or a registry reference")
 	case *checks != "":
-		return testSource(ctx, *checks, fs.Arg(0), image.Options{Insecure: *insecure}, stdout, stderr)
+		return testSource(ctx, *checks, *name, fs.Arg(0), image.Options{Insecure: *insecure}, stdout, stderr)
+	case *name != "":
+		return usageErr(fs, "-image only applies with -checks; with -f, name images as arguments")
 	}
 
 	f, err := config.Load(*file)
@@ -104,20 +106,25 @@ func runTest(ctx context.Context, args []string, stdout, stderr io.Writer) error
 }
 
 // testSource runs the checks in file against a layout or registry image.
-func testSource(ctx context.Context, file, source string, opts image.Options, stdout, stderr io.Writer) error {
-	data, err := os.ReadFile(file)
+// file is a build file; a file holding only tests: is one too. name
+// picks the image whose tests to run when the file has several.
+func testSource(ctx context.Context, file, name, source string, opts image.Options, stdout, stderr io.Writer) error {
+	f, err := config.Load(file)
 	if err != nil {
 		return err
 	}
-	var doc struct {
-		Tests []check.Check `yaml:"tests"`
+	var names []string
+	if name != "" {
+		names = []string{name}
+	} else if len(f.Images) > 1 {
+		return fmt.Errorf("%s has %d images; pick one with -image", file, len(f.Images))
 	}
-	dec := yaml.NewDecoder(bytes.NewReader(data))
-	dec.KnownFields(true)
-	if err := dec.Decode(&doc); err != nil {
-		return fmt.Errorf("%s: %w", file, err)
+	sel, err := f.Select(names)
+	if err != nil {
+		return err
 	}
-	if len(doc.Tests) == 0 {
+	tests := sel[0].Tests
+	if len(tests) == 0 {
 		return fmt.Errorf("%s: no tests", file)
 	}
 	var art image.Artifact
@@ -129,7 +136,7 @@ func testSource(ctx context.Context, file, source string, opts image.Options, st
 	} else if art, err = image.Fetch(ctx, source, opts); err != nil {
 		return err
 	}
-	if err := runChecks(art, doc.Tests, "", stderr); err != nil {
+	if err := runChecks(art, tests, "", stderr); err != nil {
 		return err
 	}
 	fmt.Fprintln(stdout, "ok")

@@ -181,6 +181,24 @@ func TestMergeFlagsOverFile(t *testing.T) {
 	}
 }
 
+func TestExampleFile(t *testing.T) {
+	f, err := Load(filepath.Join("..", "..", "examples", "construct.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	images, err := f.Select(nil)
+	if err != nil || len(images) != 2 {
+		t.Fatalf("images = %d, %v", len(images), err)
+	}
+	api, migrate := images[0], images[1]
+	if len(api.Tests) != 4 || len(api.Layers) != 1 || len(api.Layers[0].Contents) != 4 || api.Rootfs.Image().CACerts != image.System {
+		t.Errorf("api = %+v", api)
+	}
+	if migrate.Tags[0] != "registry.example.com/team/migrate:{git.short}" || len(*migrate.Entrypoint) != 2 {
+		t.Errorf("migrate = %+v", migrate)
+	}
+}
+
 func TestParseRootfs(t *testing.T) {
 	doc := "rootfs: {skeleton: true, users: [\"a:1\"], ca-certs: certs/ca.pem, tzdata: system}\n" +
 		"images:\n  - name: x\n    rootfs: {users: [\"b:2\"]}\n"

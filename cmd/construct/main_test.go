@@ -660,10 +660,26 @@ entrypoint: [/app]
 		t.Errorf("-checks exit %d: %s", code, stderr)
 	}
 
+	// The build file itself works as a -checks file.
+	if code, _, stderr := runCLI(t, "test", "-checks", file, filepath.Join(dir, "out")); code != 0 || !strings.Contains(stderr, "6 tests passed") {
+		t.Errorf("-checks build file: exit %d: %s", code, stderr)
+	}
+	multi := filepath.Join(dir, "multi.yaml")
+	if err := os.WriteFile(multi, []byte("images:\n  - {name: a, tests: [{absent: /x}]}\n  - {name: b, tests: [{file: /x}]}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, stderr := runCLI(t, "test", "-checks", multi, filepath.Join(dir, "out")); code != 1 || !strings.Contains(stderr, "-image") {
+		t.Errorf("multi without -image: exit %d: %s", code, stderr)
+	}
+	if code, _, stderr := runCLI(t, "test", "-checks", multi, "-image", "a", filepath.Join(dir, "out")); code != 0 {
+		t.Errorf("multi -image a: exit %d: %s", code, stderr)
+	}
+
 	for _, args := range [][]string{
 		{"test"},
 		{"test", "-f", file, "-checks", checks},
 		{"test", "-checks", checks},
+		{"test", "-f", file, "-image", "a"},
 	} {
 		if code, _, _ := runCLI(t, args...); code != 2 {
 			t.Errorf("%q: exit %d, want 2", args, code)

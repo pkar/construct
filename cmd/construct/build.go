@@ -41,7 +41,7 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	fs.SetOutput(stderr)
 	var (
 		file       = fs.String("f", "", "read images from build `file`, e.g. construct.yaml")
-		base       = fs.String("base", "", "base image reference, or scratch (default scratch)")
+		base       = fs.String("base", "", "base image `reference`, or scratch (default scratch)")
 		platform   = fs.String("platform", "", "target `platforms` as os/arch[/variant], comma-separated; several build an image index\n(default linux/"+runtime.GOARCH+")")
 		push       = fs.Bool("push", false, "push the image to every -tag")
 		layoutDir  = fs.String("oci-layout", "", "write the image to an OCI layout `directory`")

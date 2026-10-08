@@ -1,0 +1,64 @@
+# Example build file: construct build -f examples/construct.yaml
+#
+# Top-level fields are defaults for every image under images:. Settings
+# replace them per image; layers, env, expose, volumes, and tests add to
+# them; labels and annotations merge key by key. Relative paths are
+# relative to this file.
+
+base: scratch
+platforms: [linux/amd64, linux/arm64]
+compression: zstd
+
+# A usable root filesystem without a distro base image.
+rootfs:
+  skeleton: true        # /etc, /tmp, passwd and group with nonroot (65532)
+  ca-certs: system      # the build machine's CA bundle
+  tzdata: system
+
+user: nonroot
+env: {TZ: UTC}
+labels:
+  org.opencontainers.image.licenses: MIT
+
+tests:
+  - {file: /etc/ssl/certs/ca-certificates.crt, type: file}
+  - {absent: /bin/sh}
+
+images:
+  - name: api
+    # Inside [ ] lists, quote values with {braces}; YAML reads a bare {
+    # there as the start of a mapping. Block lists like this need no quotes.
+    tags:
+      - registry.example.com/team/api:{git.short}
+      - registry.example.com/team/api:latest
+    push: true
+    entrypoint: [/usr/local/bin/api]
+    expose: [8080]
+    layers:
+      - name: app
+        contents:
+          # SRC:DST[:OPTIONS], the same as -add. {arch} expands per platform.
+          - dist/api-linux-{arch}:/usr/local/bin/api:mode=0755
+          - src: static
+            dst: /srv/static
+            owner: 65532
+          - mkdir: /var/lib/api
+            mode: "0700"
+            owner: 65532:65532
+          - file: /etc/api/config.toml
+            content: |
+              listen = ":8080"
+    tests:
+      - {file: /usr/local/bin/api, mode: "0755"}
+      - config: {user: nonroot, expose: [8080]}
+
+  - name: migrate
+    platforms: linux/amd64
+    tags: ["registry.example.com/team/migrate:{git.short}"]
+    tarball: dist/migrate.tar
+    entrypoint: /usr/local/bin/migrate up
+    layers:
+      - contents:
+          - dist/migrate-linux-amd64:/usr/local/bin/migrate
+          - symlink: /migrate
+            target: /usr/local/bin/migrate
