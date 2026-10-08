@@ -90,6 +90,8 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		user       = fs.String("user", "", "user[:group] to run as")
 		insecure   = fs.Bool("insecure", false, "allow plain HTTP and unverified TLS registries")
 		stopSignal = fs.String("stop-signal", "", "`SIGNAL` that stops the container, e.g. SIGINT")
+		compress   = fs.String("compression", "gzip", "layer `compression`: gzip, or zstd (smaller and faster; needs an OCI base and a recent runtime)")
+		level      = fs.Int("compression-level", 0, "compression `level`: 1-9 for gzip, 1-22 for zstd; 0 for the default")
 		useVCS     = fs.Bool("vcs", true, "annotate the image with the Git commit and source URL of the current directory")
 		expose     repeated
 		volumes    repeated
@@ -141,6 +143,9 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return err
 	}
 
+	if err := image.CheckCompression(*compress, *level); err != nil {
+		return usageErr(fs, "%v", err)
+	}
 	platforms, err := image.ParsePlatforms(*platform)
 	if err != nil {
 		return err
@@ -159,6 +164,9 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		User:       *user,
 		StopSignal: *stopSignal,
 		Volumes:    volumes,
+
+		Compression:      *compress,
+		CompressionLevel: *level,
 	}
 	for _, p := range expose {
 		port, err := image.ParsePort(p)
