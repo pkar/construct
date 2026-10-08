@@ -227,9 +227,10 @@ fails if:
 `-refresh` ignores the cache, reruns every run layer, and updates the lock.
 Whether a rerun gives the same layer depends on the script. An `apk add`
 on a pinned Alpine base reproduced the same digest in testing. Package
-managers that write logs or timestamps (apt and dpkg write
-`/var/log/apt`, `/var/log/dpkg.log`, and `*-old` backups) won't, unless the
-script deletes those files.
+managers that write logs and timestamps probably won't: apt and dpkg write
+`/var/log/apt`, `/var/log/dpkg.log`, and `*-old` backups. Deleting those
+in the script helps, but check with `-refresh -lock` on a second machine
+before relying on `-locked` in CI.
 
 ## Image config
 
