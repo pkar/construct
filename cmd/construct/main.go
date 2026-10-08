@@ -83,8 +83,7 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	var (
 		base       = fs.String("base", image.Scratch, "base image reference, or scratch")
 		platform   = fs.String("platform", "linux/"+runtime.GOARCH, "target `platforms` as os/arch[/variant], comma-separated; several build an image index")
-		tag        = fs.String("tag", "", "image reference, e.g. registry.example.com/team/app:v1")
-		push       = fs.Bool("push", false, "push the image to -tag")
+		push       = fs.Bool("push", false, "push the image to every -tag")
 		layoutDir  = fs.String("oci-layout", "", "write the image to an OCI layout directory")
 		tarFile    = fs.String("tarball", "", "write a docker/podman-loadable tarball (needs -tag)")
 		workdir    = fs.String("workdir", "", "working directory")
@@ -95,6 +94,7 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		expose     repeated
 		volumes    repeated
 		annots     repeated
+		tags       repeated
 		entrypoint optionalList
 		cmd        optionalList
 		layers     layerFlags
@@ -109,6 +109,7 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	fs.Var(&cmd, "cmd", `default arguments as a JSON array or space-separated words`)
 	fs.Var(&env, "env", "set `KEY=VALUE` in the environment (repeatable)")
 	fs.Var(&labels, "label", "set label `KEY=VALUE` (repeatable)")
+	fs.Var(&tags, "tag", "image `reference`, e.g. registry.example.com/team/app:v1 (repeatable); {git.commit}, {git.short},\n{git.branch}, {git.tag}, and {env.NAME} expand here and in -label and -annotation values")
 	fs.Var(&annots, "annotation", "set manifest annotation `KEY=VALUE` (repeatable)")
 	fs.Var(&expose, "expose", "expose `PORT[/PROTO]` (repeatable)")
 	fs.Var(&volumes, "volume", "declare volume `PATH` (repeatable)")
@@ -125,8 +126,19 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	if !*push && *layoutDir == "" && *tarFile == "" {
 		return usageErr(fs, "nothing to do: set -push, -oci-layout, or -tarball")
 	}
-	if (*push || *tarFile != "") && *tag == "" {
+	if (*push || *tarFile != "") && len(tags) == 0 {
 		return usageErr(fs, "-push and -tarball need -tag")
+	}
+	stamper := &vcs.Stamper{Dir: "."}
+	for i, t := range tags {
+		x, err := stamper.Expand(t, true)
+		if err != nil {
+			return fmt.Errorf("tag %w", err)
+		}
+		tags[i] = x
+	}
+	if _, err := image.ParseRefs(tags, image.Options{Insecure: *insecure}); err != nil {
+		return err
 	}
 
 	platforms, err := image.ParsePlatforms(*platform)
@@ -174,6 +186,12 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		}
 		spec.Annotations[k] = v
 	}
+	if err := stamper.ExpandAll(spec.Labels); err != nil {
+		return fmt.Errorf("label %w", err)
+	}
+	if err := stamper.ExpandAll(spec.Annotations); err != nil {
+		return fmt.Errorf("annotation %w", err)
+	}
 
 	opts := image.Options{Insecure: *insecure}
 	var img image.Artifact
@@ -191,24 +209,32 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 
 	if *layoutDir != "" {
-		if err := image.WriteLayout(*layoutDir, img, *tag); err != nil {
+		refName := ""
+		if len(tags) > 0 {
+			refName = tags[0]
+		}
+		if err := image.WriteLayout(*layoutDir, img, refName); err != nil {
 			return err
 		}
 		fmt.Fprintf(stderr, "wrote OCI layout %s\n", *layoutDir)
 	}
 	if *tarFile != "" {
-		if err := image.WriteTarball(*tarFile, img, *tag, opts); err != nil {
+		if err := image.WriteTarball(*tarFile, img, tags, opts); err != nil {
 			return err
 		}
 		fmt.Fprintf(stderr, "wrote tarball %s\n", *tarFile)
 	}
 	if *push {
-		ref, err := image.Push(ctx, img, *tag, opts)
+		refs, err := image.PushAll(ctx, img, tags, opts)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(stderr, "pushed %s\n", *tag)
-		fmt.Fprintln(stdout, ref)
+		for _, t := range tags {
+			fmt.Fprintf(stderr, "pushed %s\n", t)
+		}
+		for _, r := range refs {
+			fmt.Fprintln(stdout, r)
+		}
 		return nil
 	}
 	fmt.Fprintln(stdout, digest)
