@@ -168,6 +168,68 @@ func TestBuildLayers(t *testing.T) {
 	}
 }
 
+func TestBuildConfigExtras(t *testing.T) {
+	spec := Spec{
+		Base:         Scratch,
+		Platform:     v1.Platform{OS: "linux", Architecture: "amd64"},
+		ExposedPorts: []string{"8080", "53/udp", "08080/tcp"},
+		Volumes:      []string{"/data/", "/cache"},
+		StopSignal:   "SIGINT",
+		Annotations:  map[string]string{"org.opencontainers.image.revision": "abc"},
+	}
+	img, err := Build(context.Background(), spec, anonymous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cf, err := img.ConfigFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := cf.Config
+	if len(c.ExposedPorts) != 2 || len(c.Volumes) != 2 || c.StopSignal != "SIGINT" {
+		t.Errorf("config = %+v", c)
+	}
+	for _, k := range []string{"8080/tcp", "53/udp"} {
+		if _, ok := c.ExposedPorts[k]; !ok {
+			t.Errorf("missing port %s in %v", k, c.ExposedPorts)
+		}
+	}
+	if _, ok := c.Volumes["/data"]; !ok {
+		t.Errorf("volumes = %v", c.Volumes)
+	}
+	m, err := img.Manifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Annotations["org.opencontainers.image.revision"] != "abc" {
+		t.Errorf("manifest annotations = %v", m.Annotations)
+	}
+
+	idx, err := BuildIndex(context.Background(), spec, []v1.Platform{{OS: "linux", Architecture: "amd64"}, {OS: "linux", Architecture: "arm64"}}, anonymous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	im, err := idx.IndexManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if im.Annotations["org.opencontainers.image.revision"] != "abc" {
+		t.Errorf("index annotations = %v", im.Annotations)
+	}
+
+	for _, bad := range []Spec{
+		{ExposedPorts: []string{"http"}},
+		{ExposedPorts: []string{"70000"}},
+		{ExposedPorts: []string{"80/icmp"}},
+		{Volumes: []string{"data"}},
+	} {
+		bad.Base = Scratch
+		if _, err := Build(context.Background(), bad, anonymous); err == nil {
+			t.Errorf("spec %+v accepted", bad)
+		}
+	}
+}
+
 func TestBuildRejectsBadEnv(t *testing.T) {
 	_, err := Build(context.Background(), Spec{Base: Scratch, Env: []string{"NOEQUALS"}}, anonymous)
 	if err == nil {

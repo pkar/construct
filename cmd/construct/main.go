@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/pkar/construct/internal/image"
+	"github.com/pkar/construct/internal/vcs"
 )
 
 // version is stamped by the release build via -ldflags.
@@ -89,6 +90,11 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		workdir    = fs.String("workdir", "", "working directory")
 		user       = fs.String("user", "", "user[:group] to run as")
 		insecure   = fs.Bool("insecure", false, "allow plain HTTP and unverified TLS registries")
+		stopSignal = fs.String("stop-signal", "", "`SIGNAL` that stops the container, e.g. SIGINT")
+		useVCS     = fs.Bool("vcs", true, "annotate the image with the Git commit and source URL of the current directory")
+		expose     repeated
+		volumes    repeated
+		annots     repeated
 		entrypoint optionalList
 		cmd        optionalList
 		layers     layerFlags
@@ -103,6 +109,9 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	fs.Var(&cmd, "cmd", `default arguments as a JSON array or space-separated words`)
 	fs.Var(&env, "env", "set `KEY=VALUE` in the environment (repeatable)")
 	fs.Var(&labels, "label", "set label `KEY=VALUE` (repeatable)")
+	fs.Var(&annots, "annotation", "set manifest annotation `KEY=VALUE` (repeatable)")
+	fs.Var(&expose, "expose", "expose `PORT[/PROTO]` (repeatable)")
+	fs.Var(&volumes, "volume", "declare volume `PATH` (repeatable)")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), "Usage: construct build [flags]\n\nAt least one of -push, -oci-layout, or -tarball is required.\n\nFlags:\n")
 		fs.PrintDefaults()
@@ -136,19 +145,34 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		Env:        env,
 		WorkDir:    *workdir,
 		User:       *user,
+		StopSignal: *stopSignal,
+		Volumes:    volumes,
+	}
+	for _, p := range expose {
+		port, err := image.ParsePort(p)
+		if err != nil {
+			return usageErr(fs, "%v", err)
+		}
+		spec.ExposedPorts = append(spec.ExposedPorts, port)
 	}
 	if spec.Created, err = buildTime(); err != nil {
 		return err
 	}
-	if len(labels) > 0 {
-		spec.Labels = map[string]string{}
-		for _, kv := range labels {
-			k, v, ok := strings.Cut(kv, "=")
-			if !ok || k == "" {
-				return fmt.Errorf("label %q: want KEY=VALUE", kv)
-			}
-			spec.Labels[k] = v
+	if spec.Labels, err = keyValues("label", labels); err != nil {
+		return err
+	}
+	if *useVCS {
+		spec.Annotations = vcsAnnotations(".", stderr)
+	}
+	extra, err := keyValues("annotation", annots)
+	if err != nil {
+		return err
+	}
+	for k, v := range extra {
+		if spec.Annotations == nil {
+			spec.Annotations = map[string]string{}
 		}
+		spec.Annotations[k] = v
 	}
 
 	opts := image.Options{Insecure: *insecure}
@@ -216,6 +240,39 @@ func runPush(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	fmt.Fprintf(stderr, "pushed %s\n", fs.Arg(1))
 	fmt.Fprintln(stdout, ref)
 	return nil
+}
+
+// keyValues parses KEY=VALUE pairs; it returns nil for an empty list.
+func keyValues(what string, list []string) (map[string]string, error) {
+	if len(list) == 0 {
+		return nil, nil
+	}
+	m := map[string]string{}
+	for _, kv := range list {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || k == "" {
+			return nil, fmt.Errorf("%s %q: want KEY=VALUE", what, kv)
+		}
+		m[k] = v
+	}
+	return m, nil
+}
+
+// vcsAnnotations returns the OCI revision and source annotations for the
+// Git working tree containing dir, or nil outside a repository.
+func vcsAnnotations(dir string, stderr io.Writer) map[string]string {
+	info, err := vcs.Read(dir)
+	if err != nil {
+		return nil
+	}
+	if info.Dirty {
+		fmt.Fprintf(stderr, "construct: warning: %s has uncommitted changes; the revision annotation names commit %s\n", dir, info.Short)
+	}
+	m := map[string]string{"org.opencontainers.image.revision": info.Commit}
+	if info.Remote != "" {
+		m["org.opencontainers.image.source"] = info.Remote
+	}
+	return m
 }
 
 func parse(fs *flag.FlagSet, args []string) error {
