@@ -16,20 +16,30 @@ are cached and pinned instead; see [Run layers](#run-layers).
 
 ## Install
 
-With the installer (needs `gh` logged in to an account that can read this
-private repository, or plain `curl` once the repository is public):
+```sh
+curl -fsSL https://raw.githubusercontent.com/pkar/construct/main/install.sh | sh
+```
+
+To read the script first, download it and run it yourself:
 
 ```sh
-gh api repos/pkar/construct/contents/install.sh -H 'Accept: application/vnd.github.raw' > install.sh
+curl -fsSLO https://raw.githubusercontent.com/pkar/construct/main/install.sh
+less install.sh
 sh install.sh
 ```
 
-Or run `sh install.sh` from a clone. It resolves the latest release once and
-fetches everything from that tag. On Linux amd64/arm64 and macOS arm64 it
+To install somewhere else, set `CONSTRUCT_INSTALL_DIR`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/pkar/construct/main/install.sh | CONSTRUCT_INSTALL_DIR=/usr/local/bin sh
+```
+
+The installer resolves the latest release once and fetches everything from
+that tag. It uses `curl`, or a logged-in `gh` CLI when there is one, which
+avoids anonymous GitHub rate limits. On Linux amd64/arm64 and macOS arm64 it
 downloads the binary and checks it against the release's `checksums.txt`; on
 other Linux/macOS targets it builds that tag with Go. It installs to
-`~/.local/bin`; set `CONSTRUCT_INSTALL_DIR` to choose another directory.
-Checksums catch corrupted downloads; they are not independent signatures.
+`~/.local/bin` by default. Checksums catch corrupted downloads; they are not independent signatures.
 
 From source:
 

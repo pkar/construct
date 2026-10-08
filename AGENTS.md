@@ -28,24 +28,26 @@ handling use `github.com/google/go-containerregistry`; build files use
 - `internal/check/`: structure tests run against the flattened filesystem
   and config.
 - `examples/construct.yaml` and `examples/run.yaml`: documented examples;
-  `TestExampleFile` and `TestRunExampleFile` keep them parsing. Keep them and README.md in step
-  with the flags.
+  `TestExampleFile` and `TestRunExampleFile` keep them parsing. Keep them and README.md in
+  step with the flags.
 - `.github/workflows/`: `ci.yml` (Linux/macOS checks) and `release.yml`
   (tests, then `make dist` and `gh release create` on `v*` tags). Release
   targets live in `DIST_TARGETS` in the Makefile.
 - `install.sh`: installs the latest release, verifying `checksums.txt`, or
-  builds the tag with Go on other targets. Uses a logged-in `gh` (the repo
-  is private) and falls back to anonymous `curl`. `install_test.go` runs it
+  builds the tag with Go on other targets. Uses a logged-in `gh` when
+  available (avoids rate limits) and falls back to anonymous `curl`. The
+  README installs with `curl .../main/install.sh | sh`. `install_test.go` runs it
   against fake `gh`/`curl`/`go`; keep asset names in step with `make dist`.
 
-GitHub remote: `git@github.com:pkar/construct.git`. Do not push tags or
-publish releases unless asked.
-
-Run layers are the exception: they are cached by input hash and pinned
-in `construct.lock` rather than rebuilt byte for byte.
+GitHub remote: `git@github.com:pkar/construct.git` (public). Do not push
+tags or publish releases unless asked. Public repo: keep personal
+hostnames, paths, and machine details out of tracked files and commit
+messages.
 
 Builds must stay reproducible: sorted tar entries, root ownership, and
-timestamps from `SOURCE_DATE_EPOCH` (default Unix epoch). Tests use an
+timestamps from `SOURCE_DATE_EPOCH` (default Unix epoch). Run layers are
+the exception: they are cached by input hash and pinned in
+`construct.lock` rather than rebuilt byte for byte. Tests use an
 in-process registry, so they need no network or Docker; `-load` tests use a
 fake engine script on `PATH`. In the macOS sandbox, `go test` needs loopback
 networking for the `httptest` registry.

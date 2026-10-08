@@ -3,8 +3,8 @@
 # linux/arm64, and darwin/arm64 it downloads the prebuilt binary and checks
 # it against the release's checksums.txt; on other Linux/macOS targets it
 # builds the same tag with Go. Downloads go through a logged-in gh CLI when
-# one is available (required while the repository is private), otherwise
-# anonymous curl. Installs to $CONSTRUCT_INSTALL_DIR (default ~/.local/bin).
+# one is available, which avoids anonymous rate limits, otherwise curl.
+# Installs to $CONSTRUCT_INSTALL_DIR (default ~/.local/bin).
 set -eu
 REPO=pkar/construct
 fail() { echo "construct install: $*" >&2; exit 1; }
@@ -33,7 +33,7 @@ gh)
  ;;
 curl)
  release=$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" 2>/dev/null) ||
-  fail "could not resolve the latest release of $REPO (private repository? install gh and run 'gh auth login')"
+  fail "could not resolve the latest release of $REPO (check the network; if GitHub is rate-limiting you, install gh and run 'gh auth login')"
  prefix="https://github.com/$REPO/releases/tag/"
  case "$release" in "$prefix"*) tag=${release#"$prefix"} ;; *) fail "invalid release URL" ;; esac
  ;;
