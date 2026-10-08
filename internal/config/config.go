@@ -18,6 +18,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/pkar/construct/internal/check"
 	"github.com/pkar/construct/internal/image"
 )
 
@@ -53,6 +54,8 @@ type Image struct {
 	StopSignal  *string           `yaml:"stop-signal"`
 	User        *string           `yaml:"user"`
 	WorkDir     *string           `yaml:"workdir"`
+
+	Tests []check.Check `yaml:"tests"`
 }
 
 // Rootfs asks construct to generate the files a minimal image needs; see
@@ -379,6 +382,7 @@ func Merge(base, over Image) Image {
 	out.Env = concat(base.Env, over.Env)
 	out.Expose = concat(base.Expose, over.Expose)
 	out.Volumes = concat(base.Volumes, over.Volumes)
+	out.Tests = concat(base.Tests, over.Tests)
 	out.Labels = mergeMap(base.Labels, over.Labels)
 	out.Annotations = mergeMap(base.Annotations, over.Annotations)
 	return out

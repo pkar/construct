@@ -15,6 +15,7 @@ import (
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 
+	"github.com/pkar/construct/internal/check"
 	"github.com/pkar/construct/internal/config"
 	"github.com/pkar/construct/internal/image"
 	"github.com/pkar/construct/internal/vcs"
@@ -58,6 +59,7 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		caCerts    = fs.String("ca-certs", "", "add CA certificates from PEM `file` at "+image.CACertsPath+"; system uses\nthe build machine's bundle")
 		tzdata     = fs.String("tzdata", "", "add time zone data from zoneinfo `directory` at "+image.ZoneinfoDir+"; system uses\nthe build machine's")
 		users      repeated
+		runTests   = fs.Bool("test", true, "run the build file's tests before writing outputs")
 		lockPath   = fs.String("lock", "", "pin base images to the digests in lock `file`, adding missing ones (default\nconstruct.lock next to -f, when it exists)")
 		locked     = fs.Bool("locked", false, "fail if a base image is missing from the lock file; never update it")
 		entrypoint optionalList
@@ -199,7 +201,10 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	plans := make([]*plan, 0, len(images))
 	outputs := map[string]string{}
 	for _, im := range images {
-		p, err := newPlan(im, dir, stderr)
+		p, err := newPlan(im, dir, false, stderr)
+		if p != nil {
+			p.skipTests = !*runTests
+		}
 		var ue usageError
 		switch {
 		case errors.As(err, &ue) && *file == "":
@@ -249,6 +254,8 @@ type plan struct {
 	tarball   string
 	load      bool
 	engine    string
+	checks    []check.Check
+	skipTests bool
 	opts      image.Options
 }
 
@@ -269,17 +276,23 @@ func (p *plan) errorf(format string, a ...any) error {
 // newPlan checks im and resolves defaults, stamps, and Git annotations.
 // dir is the directory whose Git state stamps the image. The returned plan
 // is non-nil even on error, so errors can name the image.
-func newPlan(im config.Image, dir string, stderr io.Writer) (*plan, error) {
+//
+// With testOnly, outputs are ignored: the plan builds the image in memory
+// so construct test can check it.
+func newPlan(im config.Image, dir string, testOnly bool, stderr io.Writer) (*plan, error) {
 	p := &plan{
-		name:    im.Name,
-		push:    deref(im.Push),
-		layout:  deref(im.OCILayout),
-		tarball: deref(im.Tarball),
-		load:    deref(im.Load),
-		engine:  deref(im.Engine),
-		opts:    image.Options{Insecure: deref(im.Insecure)},
+		name:   im.Name,
+		checks: im.Tests,
+		opts:   image.Options{Insecure: deref(im.Insecure)},
 	}
-	if !p.push && p.layout == "" && p.tarball == "" && !p.load {
+	if !testOnly {
+		p.push = deref(im.Push)
+		p.layout = deref(im.OCILayout)
+		p.tarball = deref(im.Tarball)
+		p.load = deref(im.Load)
+		p.engine = deref(im.Engine)
+	}
+	if !testOnly && !p.push && p.layout == "" && p.tarball == "" && !p.load {
 		return p, usagef("nothing to do: set -push, -oci-layout, -tarball, or -load")
 	}
 	if (p.push || p.tarball != "" || p.load) && len(im.Tags) == 0 {
@@ -389,19 +402,26 @@ func newPlan(im config.Image, dir string, stderr io.Writer) (*plan, error) {
 	return p, nil
 }
 
-// run builds the image and writes every output.
-func (p *plan) run(ctx context.Context, stdout, stderr io.Writer) error {
-	var (
-		art image.Artifact
-		err error
-	)
+// build builds the image or index in memory.
+func (p *plan) build(ctx context.Context) (image.Artifact, error) {
 	if len(p.platforms) == 1 {
 		spec := p.spec
 		spec.Platform = p.platforms[0]
-		art, err = image.Build(ctx, spec, p.opts)
-	} else {
-		art, err = image.BuildIndex(ctx, p.spec, p.platforms, p.opts)
+		return image.Build(ctx, spec, p.opts)
 	}
+	return image.BuildIndex(ctx, p.spec, p.platforms, p.opts)
+}
+
+func (p *plan) prefix() string {
+	if p.name == "" {
+		return ""
+	}
+	return p.name + ": "
+}
+
+// run builds the image, runs its tests, and writes every output.
+func (p *plan) run(ctx context.Context, stdout, stderr io.Writer) error {
+	art, err := p.build(ctx)
 	if err != nil {
 		return err
 	}
@@ -409,9 +429,11 @@ func (p *plan) run(ctx context.Context, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	prefix := ""
-	if p.name != "" {
-		prefix = p.name + ": "
+	prefix := p.prefix()
+	if len(p.checks) > 0 && !p.skipTests {
+		if err := runChecks(art, p.checks, prefix, stderr); err != nil {
+			return err
+		}
 	}
 
 	if p.layout != "" {

@@ -146,6 +146,22 @@ func ReadLayout(dir string) (Artifact, error) {
 	return a, err
 }
 
+// Fetch reads the image or index ref from a registry.
+func Fetch(ctx context.Context, ref string, opts Options) (Artifact, error) {
+	r, err := name.ParseReference(ref, opts.nameOptions()...)
+	if err != nil {
+		return nil, fmt.Errorf("reference %q: %w", ref, err)
+	}
+	desc, err := remote.Get(r, opts.remoteOptions(ctx)...)
+	if err != nil {
+		return nil, fmt.Errorf("fetch %s: %w", ref, err)
+	}
+	if desc.MediaType.IsIndex() {
+		return desc.ImageIndex()
+	}
+	return desc.Image()
+}
+
 // ReadLayoutRef is ReadLayout that also returns the image's ref.name
 // annotation, which is empty if the layout was written without a tag.
 func ReadLayoutRef(dir string) (Artifact, string, error) {
